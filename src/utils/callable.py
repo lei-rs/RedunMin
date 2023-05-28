@@ -5,12 +5,7 @@ import numpy as np
 from PIL import Image
 from torch import Tensor
 
-NORM = {
-  'imagenet': {
-    'mean': [0.485, 0.456, 0.406],
-    'std': [0.229, 0.224, 0.225]
-    }
-}
+from constants import NUM_FRAMES
 
 
 def gfn(idx: int):
@@ -36,7 +31,7 @@ class SampleFrames:
         self.mode = mode
 
     def __call__(self, sample: Dict):
-        num_frames = sample['.num_frames']
+        num_frames = sample[NUM_FRAMES]
 
         if self.frames_out > num_frames:
             return sample
@@ -47,14 +42,14 @@ class SampleFrames:
         elif self.mode == 'uniform':
             indices = indices[:-1]
         ret = {gfn(i): sample[gfn(idx)] for i, idx in enumerate(indices)}
-        ret['.num_frames'] = self.frames_out
+        ret[NUM_FRAMES] = self.frames_out
         return ret
 
 
 class FramesToArray:
     def __call__(self, sample: Dict):
         images = []
-        for i in range(sample['.num_frames']):
+        for i in range(sample[NUM_FRAMES]):
             stream = io.BytesIO(sample[gfn(i)].read())
             images.append(np.asarray(Image.open(stream), dtype=np.uint8))
         return np.transpose(np.asarray(images), (0, 3, 1, 2))

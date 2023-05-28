@@ -1,12 +1,14 @@
+from typing import List, Callable, Iterator
 from typing import Optional
 
 import lightning as L
 import numpy as np
 from torch import Tensor, from_numpy
 from torchdata.dataloader2 import SequentialReadingService, MultiProcessingReadingService, DataLoader2
+from torchdata.datapipes.iter import IterDataPipe
 from torchdata.datapipes.iter import IterableWrapper
 
-from datapipes import *
+from datapipes import SingleWorkerDataset
 
 
 class Dataloader:
@@ -30,7 +32,6 @@ class Dataloader:
             self.global_seed = np.random.randint(0, 2 ** 32 - 1)
         else:
             self.global_seed = global_seed
-        np.random.seed(self.global_seed)
         self.shards = IterableWrapper(shards).shuffle()
         self.dl = DataLoader2(self.get_single_worker_dataset(), reading_service=self.get_reading_service())
 
@@ -65,9 +66,8 @@ class Dataloader:
             dl = dl.batch(self.batch_size)
         return dl
 
-    def __iter__(self) -> Tensor:
-        for x in self.get_wrapped_dl():
-            yield x
+    def __iter__(self) -> Iterator[Tensor]:
+        return iter(self.get_wrapped_dl())
 
 
 class DataModule(L.LightningDataModule):

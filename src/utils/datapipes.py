@@ -1,19 +1,18 @@
 from typing import List, Dict, Callable, Iterable
+
 from torchdata.datapipes.iter import IterDataPipe, FileOpener
+
+from constants import NUM_FRAMES, TARGET
 
 
 def decode_md(item):
     key, value = item
-    if key.endswith('.jpeg'):
-        pass
-    elif key.endswith('.cls'):
-        value = int(value.read())
-    elif key.endswith('.num_frames'):
+    if key.endswith('.cls') or key.endswith(NUM_FRAMES):
         value = int(value.read())
     return key, value
 
 
-def decode_wd_key(sample: Dict):
+def decode_wd_key(sample: Dict) -> Dict:
     sample['__key__'] = sample['__key__'].split('/')[-1]
     return sample
 
@@ -39,7 +38,7 @@ class SplitWDSample(IterDataPipe):
     @staticmethod
     def _split(sample: Dict):
         key = sample.pop('__key__')
-        target = sample.pop('.target.cls')
+        target = sample.pop(TARGET)
         return key, target, sample
 
     def __iter__(self):

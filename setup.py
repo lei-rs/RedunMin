@@ -1,12 +1,12 @@
 from setuptools import setup
 
 setup(
-    name='STT',
+    name='Redun Min',
     version='',
-    packages=['src', 'src.utils'],
-    url='',
+    packages=['src', 'src.utils', 'src.models'],
+    url='https://github.com/leifu1128/RedunMIn',
     license='',
-    author='lei',
-    author_email='',
-    description=''
+    author='Lei Fu',
+    author_email='fu306@purdue.edu',
+    description='Minimizing redundant tokens in transformers'
 )
