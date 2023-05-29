@@ -3,9 +3,9 @@ from typing import Dict, Literal
 
 import numpy as np
 from PIL import Image
-from torch import Tensor
+from torch import Tensor, from_numpy
 
-from constants import NUM_FRAMES
+from .constants import NUM_FRAMES
 
 
 def gfn(idx: int):
@@ -21,7 +21,7 @@ class ToDevice:
     def __init__(self, device: str = 'cpu'):
         self.device = device
 
-    def __call__(self, x: Tensor):
+    def __call__(self, x: Tensor) -> Tensor:
         return x.to(self.device)
 
 
@@ -30,7 +30,7 @@ class SampleFrames:
         self.frames_out = num_frames
         self.mode = mode
 
-    def __call__(self, sample: Dict):
+    def __call__(self, sample: Dict) -> Dict:
         num_frames = sample[NUM_FRAMES]
 
         if self.frames_out > num_frames:
@@ -46,10 +46,10 @@ class SampleFrames:
         return ret
 
 
-class FramesToArray:
-    def __call__(self, sample: Dict):
+class FramesToTensor:
+    def __call__(self, sample: Dict) -> Tensor:
         images = []
         for i in range(sample[NUM_FRAMES]):
             stream = io.BytesIO(sample[gfn(i)].read())
             images.append(np.asarray(Image.open(stream), dtype=np.uint8))
-        return np.transpose(np.asarray(images), (0, 3, 1, 2))
+        return from_numpy(np.transpose(np.asarray(images), (0, 3, 1, 2)))  # (T, C, H, W)

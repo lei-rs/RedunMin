@@ -1,2 +1,2 @@
-from .callable import SampleFrames, FramesToArray
+from .callable import SampleFrames, FramesToTensor
 from .dataloaders import Dataloader

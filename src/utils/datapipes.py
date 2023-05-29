@@ -1,8 +1,9 @@
-from typing import List, Dict, Callable, Iterable
+from typing import List, Dict, Callable, Iterable, Iterator, Tuple
 
+from torch import Tensor
 from torchdata.datapipes.iter import IterDataPipe, FileOpener
 
-from constants import NUM_FRAMES, TARGET
+from .constants import NUM_FRAMES, TARGET
 
 
 def decode_md(item):
@@ -27,7 +28,7 @@ class Sequential(IterDataPipe):
             item = module(item)
         return item
 
-    def __iter__(self):
+    def __iter__(self) -> Iterator[IterDataPipe]:
         return iter(self.datapipe.map(self._call))
 
 
@@ -41,7 +42,7 @@ class SplitWDSample(IterDataPipe):
         target = sample.pop(TARGET)
         return key, target, sample
 
-    def __iter__(self):
+    def __iter__(self) -> Iterator[IterDataPipe[Tuple[str, int, Dict]]]:
         return iter(self.datapipe.map(self._split).unzip(3))
 
 
@@ -53,5 +54,5 @@ class SingleWorkerDataset(IterDataPipe):
             images = Sequential(images, transforms)
         self.pipe_out = keys.zip(targets, images)
 
-    def __iter__(self):
+    def __iter__(self) -> Iterator[Tuple[str, int, Tensor]]:
         return iter(self.pipe_out)

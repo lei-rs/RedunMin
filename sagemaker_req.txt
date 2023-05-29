@@ -1,0 +1,4 @@
+torchdata
+torchvision
+lightning
+transformers
