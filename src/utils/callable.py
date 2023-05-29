@@ -1,8 +1,7 @@
 import io
-from typing import Dict, Literal
+from typing import Dict, Literal, List
 
 import numpy as np
-from PIL import Image
 from torch import Tensor, from_numpy
 
 from .constants import NUM_FRAMES
@@ -46,10 +45,11 @@ class SampleFrames:
         return ret
 
 
-class FramesToTensor:
-    def __call__(self, sample: Dict) -> Tensor:
+class ReadFrames:
+    def __call__(self, sample: Dict) -> List:
         images = []
         for i in range(sample[NUM_FRAMES]):
             stream = io.BytesIO(sample[gfn(i)].read())
-            images.append(np.asarray(Image.open(stream), dtype=np.uint8))
-        return from_numpy(np.transpose(np.asarray(images), (0, 3, 1, 2)))  # (T, C, H, W)
+            ar = np.frombuffer(stream.getvalue(), dtype=np.uint8)
+            images.append(ar)
+        return images

@@ -42,8 +42,7 @@ class DecodeFromRaw(IterDataPipe):
                 load_from_tar().
                 map(self.decode_md).
                 webdataset().
-                map(self.decode_wd_key).
-                prefetch(10)
+                map(self.decode_wd_key)
             )
 
 
@@ -53,7 +52,6 @@ class SplitWDSample(IterDataPipe):
 
     @staticmethod
     def _split(sample: Dict):
-        print(sample.keys())
         key = sample.pop('__key__')
         target = sample.pop(TARGET)
         return key, target, sample
@@ -63,12 +61,12 @@ class SplitWDSample(IterDataPipe):
 
 
 class SingleWorkerDataset(IterDataPipe):
-    def __init__(self, datapipe: Iterable[str], transforms: List[Callable] = None):
-        datapipe = DecodeFromRaw(datapipe)
+    def __init__(self, datapipe: IterDataPipe[Dict], transforms: List[Callable] = None):
         keys, targets, images = SplitWDSample(datapipe)
         if transforms is not None:
             images = Sequential(images, transforms)
         self.pipe_out = keys.zip(targets, images)
+        self.worker_id = None
 
     def __iter__(self) -> Iterator[Tuple[str, int, Tensor]]:
         return iter(self.pipe_out)

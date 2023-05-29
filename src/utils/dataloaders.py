@@ -7,10 +7,11 @@ import torchvision.transforms as T
 from lightning import Fabric
 from torch import Tensor, from_numpy
 from torchdata.dataloader2 import MultiProcessingReadingService, DataLoader2
+from torchdata.dataloader2.utils import WorkerInfo
 from torchdata.datapipes.iter import IterDataPipe
 from torchdata.datapipes.iter import IterableWrapper
 
-from .callable import FramesToTensor, SampleFrames
+from .callable import SampleFrames
 from .datapipes import SingleWorkerDataset, DecodeFromRaw
 
 
@@ -40,11 +41,12 @@ class Dataloader:
         else:
             self.global_seed = global_seed
 
-        self.raw = IterableWrapper(shards).shuffle()
+        self.shards = IterableWrapper(shards).shuffle(buffer_size=len(shards))
         self.dl = DataLoader2(self.get_single_worker_dataset(), reading_service=self.get_reading_service())
 
     def get_single_worker_dataset(self) -> IterDataPipe:
-        dp = self.raw.sharding_filter()
+        dp = self.shards.sharding_filter()
+        dp = DecodeFromRaw(dp)
         dp = SingleWorkerDataset(dp, self.transforms)
         return dp
 
@@ -52,10 +54,16 @@ class Dataloader:
         if self.num_workers > 1:
             worker_prefetch_cnt = max(int(self.prefetch_count * self.batch_size / self.num_workers), 10)
             return MultiProcessingReadingService(num_workers=self.num_workers,
-                                                 worker_prefetch_cnt=worker_prefetch_cnt,
-                                                 main_prefetch_cnt=10)
+                                                 worker_init_fn=self.worker_init_fn,
+                                                 worker_prefetch_cnt=1,
+                                                 main_prefetch_cnt=1)
         else:
             raise NotImplementedError
+
+    @staticmethod
+    def worker_init_fn(datapipe, worker_info: WorkerInfo):
+        datapipe.worker_id = worker_info.worker_id
+        return datapipe
 
     @staticmethod
     def numpy_batcher(batch_list: List[Tensor]) -> Tensor:
@@ -97,8 +105,6 @@ class DataModule:
         self.num_workers = num_workers
         self.prefetch_count = prefetch_count
         self.crop_size = crop_size
-
-        self.frame_to_tensor = FramesToTensor()
 
         # Not Initialized
         self.shard_path = None
