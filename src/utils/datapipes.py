@@ -6,18 +6,6 @@ from torchdata.datapipes.iter import IterDataPipe, FileOpener
 from .constants import NUM_FRAMES, TARGET
 
 
-def decode_md(item):
-    key, value = item
-    if key.endswith('.cls') or key.endswith(NUM_FRAMES):
-        value = int(value.read())
-    return key, value
-
-
-def decode_wd_key(sample: Dict) -> Dict:
-    sample['__key__'] = sample['__key__'].split('/')[-1]
-    return sample
-
-
 class Sequential(IterDataPipe):
     def __init__(self, datapipe: IterDataPipe, callables: List[Callable]):
         self.datapipe = datapipe
@@ -32,12 +20,40 @@ class Sequential(IterDataPipe):
         return iter(self.datapipe.map(self._call))
 
 
+class DecodeFromRaw(IterDataPipe):
+    def __init__(self, datapipe: Iterable[str]):
+        self.datapipe = datapipe
+
+    @staticmethod
+    def decode_md(item):
+        key, value = item
+        if key.endswith('.cls') or key.endswith(NUM_FRAMES):
+            value = int(value.read())
+        return key, value
+
+    @staticmethod
+    def decode_wd_key(sample: Dict) -> Dict:
+        sample['__key__'] = sample['__key__'].split('/')[-1]
+        return sample
+
+    def __iter__(self) -> Iterator[IterDataPipe]:
+        return iter(
+                FileOpener(self.datapipe, mode='rb').
+                load_from_tar().
+                map(self.decode_md).
+                webdataset().
+                map(self.decode_wd_key).
+                prefetch(10)
+            )
+
+
 class SplitWDSample(IterDataPipe):
     def __init__(self, datapipe: IterDataPipe[Dict]):
         self.datapipe = datapipe
 
     @staticmethod
     def _split(sample: Dict):
+        print(sample.keys())
         key = sample.pop('__key__')
         target = sample.pop(TARGET)
         return key, target, sample
@@ -47,9 +63,9 @@ class SplitWDSample(IterDataPipe):
 
 
 class SingleWorkerDataset(IterDataPipe):
-    def __init__(self, shards: Iterable[str], transforms: List[Callable] = None):
-        raw_data = FileOpener(shards, mode='rb').load_from_tar().map(decode_md).webdataset().map(decode_wd_key)
-        keys, targets, images = SplitWDSample(raw_data)
+    def __init__(self, datapipe: Iterable[str], transforms: List[Callable] = None):
+        datapipe = DecodeFromRaw(datapipe)
+        keys, targets, images = SplitWDSample(datapipe)
         if transforms is not None:
             images = Sequential(images, transforms)
         self.pipe_out = keys.zip(targets, images)

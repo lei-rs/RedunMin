@@ -1,2 +1,2 @@
-NUM_FRAMES = 'num_frames'
+NUM_FRAMES = '.num_frames'
 TARGET = '.target.cls'

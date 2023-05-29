@@ -10,8 +10,8 @@ from torchdata.dataloader2 import MultiProcessingReadingService, DataLoader2
 from torchdata.datapipes.iter import IterDataPipe
 from torchdata.datapipes.iter import IterableWrapper
 
-from callable import FramesToTensor, SampleFrames
-from datapipes import SingleWorkerDataset
+from .callable import FramesToTensor, SampleFrames
+from .datapipes import SingleWorkerDataset, DecodeFromRaw
 
 
 class Dataloader:
@@ -40,20 +40,20 @@ class Dataloader:
         else:
             self.global_seed = global_seed
 
-        self.shards = IterableWrapper(shards).shuffle()
+        self.raw = IterableWrapper(shards).shuffle()
         self.dl = DataLoader2(self.get_single_worker_dataset(), reading_service=self.get_reading_service())
 
     def get_single_worker_dataset(self) -> IterDataPipe:
-        dp = self.shards.sharding_filter()
+        dp = self.raw.sharding_filter()
         dp = SingleWorkerDataset(dp, self.transforms)
         return dp
 
     def get_reading_service(self) -> MultiProcessingReadingService:
         if self.num_workers > 1:
-            worker_prefetch_cnt = int(self.prefetch_count * self.batch_size / self.num_workers)
+            worker_prefetch_cnt = max(int(self.prefetch_count * self.batch_size / self.num_workers), 10)
             return MultiProcessingReadingService(num_workers=self.num_workers,
                                                  worker_prefetch_cnt=worker_prefetch_cnt,
-                                                 main_prefetch_cnt=1)
+                                                 main_prefetch_cnt=10)
         else:
             raise NotImplementedError
 
