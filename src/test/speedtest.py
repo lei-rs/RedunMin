@@ -1,6 +1,7 @@
-from src import utils as U
-import time
 import os
+print(os.listdir())
+from .src import utils as U
+import time
 
 
 ffm = os.environ['SM_CHANNEL_TRAINING']
