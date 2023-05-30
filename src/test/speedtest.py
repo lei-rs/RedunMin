@@ -1,6 +1,5 @@
 import os
-print(os.listdir())
-from .src import utils as U
+from src import utils as U
 import time
 
 
