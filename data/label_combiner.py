@@ -10,7 +10,7 @@ val_json = json.load(open(f'{dataset}/val.json'))
 test_json = json.load(open(f'{dataset}/test.json'))
 #train_csv = pd.read_csv(f'{dataset}/train.csv')
 #val_csv = pd.read_csv(f'{dataset}/val.csv')
-#test_csv = pd.read_csv(f'{dataset}/test.csv')
+#test_csv = pd.read_csv(f'{dataset}/tests.csv')
 train_txt = open(f'{dataset}/train.txt', 'r').read().split('\n\n')
 val_txt = open(f'{dataset}/val.txt', 'r').read().split('\n\n')
 

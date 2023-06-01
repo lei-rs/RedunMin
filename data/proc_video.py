@@ -4,6 +4,7 @@ import gc
 import json
 import pathlib
 import random
+import numpy as np
 import pandas as pd
 import webdataset as wds
 from PIL import Image
@@ -46,8 +47,8 @@ class SSV2Metadata(VideoMetadata):
         self.md_path = pathlib.Path.cwd() / 'metadata'
         train = json.load(open(str(self.md_path / f'{dataset}/train.json'), 'r'))
         val = json.load(open(str(self.md_path / f'{dataset}/val.json'), 'r'))
-        test = json.load(open(str(self.md_path / f'{dataset}/test.json'), 'r'))
-        test_ans = pd.read_csv(str(self.md_path / f'{dataset}/test-answers.csv'), header=None, index_col=0, delimiter=';')
+        test = json.load(open(str(self.md_path / f'{dataset}/tests.json'), 'r'))
+        test_ans = pd.read_csv(str(self.md_path / f'{dataset}/tests-answers.csv'), header=None, index_col=0, delimiter=';')
         self.int_labels = json.load(open(str(self.md_path / f'{dataset}/labels.json'), 'r'))
 
         for entry in train:
@@ -58,14 +59,14 @@ class SSV2Metadata(VideoMetadata):
 
         for entry in test:
             entry['label'] = test_ans.loc[int(entry['id'])].values[0]
-            self._add_entry(entry, 'test')
+            self._add_entry(entry, 'tests')
 
     def _add_entry(self, entry, subset):
         self.md[entry['id']] = {
             'annotations': {
-                'label': entry['label'] if subset == 'test' else entry['template'].replace('[', '').replace(']', ''),
-                'raw_label': entry['label'] if subset != 'test' else None,
-                'placeholder': entry['placeholders'] if subset != 'test' else None,
+                'label': entry['label'] if subset == 'tests' else entry['template'].replace('[', '').replace(']', ''),
+                'raw_label': entry['label'] if subset != 'tests' else None,
+                'placeholder': entry['placeholders'] if subset != 'tests' else None,
             },
             'subset': subset
         }
@@ -82,13 +83,11 @@ def _create_sample(vid_path: pathlib.Path, vid_name: str, int_label: str):
         stream = container.streams.video[0]
         for i, frame in enumerate(container.decode(stream)):
             frame = frame.to_image()
+            if np.isnan(np.asarray(frame)).any():
+                raise Exception('Frame is None')
             h, w = frame.size
-            if h < w:
-                frame.resize(size=(int(256 * (w/h)), 256), resample=Image.LANCZOS)
-            elif w < h:
-                frame.resize(size=(256, int(256 * (h/w))), resample=Image.LANCZOS)
-            else:
-                frame.resize(size=(256, 256), resample=Image.LANCZOS)
+            if h > 240:
+                frame = frame.resize((int(w * 240 / h), 240))
             frame_bytes = io.BytesIO()
             frame.save(frame_bytes, format='JPEG', quality=85, optimize=True)
             frame.close()
@@ -132,10 +131,14 @@ class VideoToWebdataset:
         self.error_log = ['id path error']
         self.counts = {label: 0 for label in vmd.int_labels.keys()}
 
+        (output_path / 'train').mkdir(parents=True, exist_ok=True)
+        (output_path / 'val').mkdir(parents=True, exist_ok=True)
+        (output_path / 'tests').mkdir(parents=True, exist_ok=True)
+
         self.writers = {
             'train': wds.ShardWriter(str(output_path / f'train/shard_%06d.tar'), maxcount=5000, maxsize=2.5e9, encoder=False),
             'val': wds.ShardWriter(str(output_path / f'val/shard_%06d.tar'), maxcount=5000, maxsize=2.5e9, encoder=False),
-            'test': wds.ShardWriter(str(output_path / f'test/shard_%06d.tar'), maxcount=5000, maxsize=2.5e9, encoder=False),
+            'tests': wds.ShardWriter(str(output_path / f'tests/shard_%06d.tar'), maxcount=5000, maxsize=2.5e9, encoder=False),
         }
 
     def _dump_counts(self):

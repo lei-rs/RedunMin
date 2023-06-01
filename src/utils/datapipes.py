@@ -1,6 +1,7 @@
-from typing import List, Dict, Callable, Iterable, Iterator, Tuple
+from typing import List, Dict, Callable, Iterator, Tuple
 
 from torch import Tensor
+from torchdata.datapipes import functional_datapipe
 from torchdata.datapipes.iter import IterDataPipe, FileOpener
 
 from .constants import NUM_FRAMES, TARGET
@@ -20,30 +21,30 @@ class Sequential(IterDataPipe):
         return iter(self.datapipe.map(self._call))
 
 
-class DecodeFromRaw(IterDataPipe):
-    def __init__(self, datapipe: Iterable[str]):
+@functional_datapipe('read')
+class ReadToMemory(IterDataPipe):
+    def __init__(self, datapipe: IterDataPipe):
         self.datapipe = datapipe
+        print(datapipe)
 
     @staticmethod
-    def decode_md(item):
+    def _decode(item):
         key, value = item
         if key.endswith('.cls') or key.endswith(NUM_FRAMES):
             value = int(value.read())
+        elif key.endswith('.jpeg'):
+            value = value.read()
         return key, value
 
     @staticmethod
-    def decode_wd_key(sample: Dict) -> Dict:
+    def _split_key(sample: Dict) -> Dict:
         sample['__key__'] = sample['__key__'].split('/')[-1]
         return sample
 
     def __iter__(self) -> Iterator[IterDataPipe]:
-        return iter(
-                FileOpener(self.datapipe, mode='rb').
-                load_from_tar().
-                map(self.decode_md).
-                webdataset().
-                map(self.decode_wd_key)
-            )
+        dp = FileOpener(self.datapipe, mode='rb').load_from_tar().map(self._decode).webdataset()
+        for sample in dp:
+            yield self._split_key(sample)
 
 
 class SplitWDSample(IterDataPipe):
@@ -60,13 +61,13 @@ class SplitWDSample(IterDataPipe):
         return iter(self.datapipe.map(self._split).unzip(3))
 
 
-class SingleWorkerDataset(IterDataPipe):
+@functional_datapipe('spdp')
+class SingleProcDP(IterDataPipe):
     def __init__(self, datapipe: IterDataPipe[Dict], transforms: List[Callable] = None):
         keys, targets, images = SplitWDSample(datapipe)
         if transforms is not None:
             images = Sequential(images, transforms)
         self.pipe_out = keys.zip(targets, images)
-        self.worker_id = None
 
     def __iter__(self) -> Iterator[Tuple[str, int, Tensor]]:
         return iter(self.pipe_out)

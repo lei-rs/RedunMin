@@ -1,3 +1,0 @@
-torchdata
-torchvision
-lightning

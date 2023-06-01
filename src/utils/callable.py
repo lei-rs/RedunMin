@@ -1,19 +1,11 @@
-import io
-from typing import Dict, Literal, List
+from typing import Dict, Literal
 
 import numpy as np
+from imagecodecs import jpeg_decode
+from numpy import stack, uint8
 from torch import Tensor, from_numpy
 
-from .constants import NUM_FRAMES
-
-
-def gfn(idx: int):
-    """
-    Get frame name from index
-    :param idx:
-    :return str:
-    """
-    return f'.frame_{idx:06d}.jpeg'
+from .constants import NUM_FRAMES, FRAME
 
 
 class ToDevice:
@@ -33,23 +25,21 @@ class SampleFrames:
         num_frames = sample[NUM_FRAMES]
 
         if self.frames_out > num_frames:
-            return sample
+            for i in range(num_frames, self.frames_out):
+                sample[FRAME.format(i)] = sample[FRAME.format(num_frames - 1)]
+            num_frames = self.frames_out
 
         indices = np.linspace(0, num_frames, self.frames_out + 1, dtype=int)
         if self.mode == 'random':
             indices = [np.random.randint(indices[i], indices[i + 1]) for i in range(self.frames_out)]
         elif self.mode == 'uniform':
             indices = indices[:-1]
-        ret = {gfn(i): sample[gfn(idx)] for i, idx in enumerate(indices)}
+        ret = {FRAME.format(i): sample[FRAME.format(idx)] for i, idx in enumerate(indices)}
         ret[NUM_FRAMES] = self.frames_out
         return ret
 
 
-class ReadFrames:
-    def __call__(self, sample: Dict) -> List:
-        images = []
-        for i in range(sample[NUM_FRAMES]):
-            stream = io.BytesIO(sample[gfn(i)].read())
-            ar = np.frombuffer(stream.getvalue(), dtype=np.uint8)
-            images.append(ar)
-        return images
+class DecodeFrames:
+    def __call__(self, sample: Dict) -> Tensor:
+        images = [bytes(sample[FRAME.format(i)]) for i in range(sample[NUM_FRAMES])]
+        return from_numpy(stack([jpeg_decode(image) for image in images], dtype=uint8)).permute(0, 3, 1, 2).contiguous()

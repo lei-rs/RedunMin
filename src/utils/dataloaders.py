@@ -1,149 +1,177 @@
 import os
-from typing import List, Callable, Iterator, Tuple
-from typing import Optional
+from pathlib import Path
+from typing import List, Callable, Optional, Tuple, Dict, Set
 
 import numpy as np
+import torch
 import torchvision.transforms as T
-from lightning import Fabric
-from torch import Tensor, from_numpy
-from torchdata.dataloader2 import MultiProcessingReadingService, DataLoader2
-from torchdata.dataloader2.utils import WorkerInfo
-from torchdata.datapipes.iter import IterDataPipe
-from torchdata.datapipes.iter import IterableWrapper
+from lightning import LightningDataModule
+from torch import Tensor
+from torch.nn import Module, Sequential
+from torchdata.dataloader2 import DistributedReadingService, DataLoader2, ReadingServiceInterface
+from torchdata.datapipes.iter import IterDataPipe, IterableWrapper
 
-from .callable import SampleFrames
-from .datapipes import SingleWorkerDataset, DecodeFromRaw
+from .callable import SampleFrames, DecodeFrames
+
+norm_info = {
+    'ssv2': ([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
+}
 
 
-class Dataloader:
+class BaseDataModule(LightningDataModule):
     def __init__(
             self,
-            shards: List[str],
             batch_size: int,
-            shuffle: bool = True,
-            transforms: Optional[List[Callable]] = None,
-            num_workers: int = 1,
-            prefetch_count: int = 10,
-            global_seed: Optional[int] = None
-    ):
-        assert batch_size > 0
-        assert num_workers >= 1
-        assert prefetch_count >= 1
-
-        self.batch_size = batch_size
-        self.shuffle = shuffle
-        self.transforms = transforms
-        self.num_workers = num_workers
-        self.prefetch_count = prefetch_count
-
-        if global_seed is None:
-            self.global_seed = np.random.randint(0, 2 ** 32 - 1)
-        else:
-            self.global_seed = global_seed
-
-        self.shards = IterableWrapper(shards).shuffle(buffer_size=len(shards))
-        self.dl = DataLoader2(self.get_single_worker_dataset(), reading_service=self.get_reading_service())
-
-    def get_single_worker_dataset(self) -> IterDataPipe:
-        dp = self.shards.sharding_filter()
-        dp = DecodeFromRaw(dp)
-        dp = SingleWorkerDataset(dp, self.transforms)
-        return dp
-
-    def get_reading_service(self) -> MultiProcessingReadingService:
-        if self.num_workers > 1:
-            worker_prefetch_cnt = max(int(self.prefetch_count * self.batch_size / self.num_workers), 10)
-            return MultiProcessingReadingService(num_workers=self.num_workers,
-                                                 worker_init_fn=self.worker_init_fn,
-                                                 worker_prefetch_cnt=1,
-                                                 main_prefetch_cnt=1)
-        else:
-            raise NotImplementedError
-
-    @staticmethod
-    def worker_init_fn(datapipe, worker_info: WorkerInfo):
-        datapipe.worker_id = worker_info.worker_id
-        return datapipe
-
-    @staticmethod
-    def numpy_batcher(batch_list: List[Tensor]) -> Tensor:
-        np_data: np.ndarray = np.empty(len(batch_list), dtype=object)
-        for i, ar in enumerate(batch_list):
-            np_data[i] = ar.numpy()
-        return from_numpy(np.stack(np_data))
-
-    def get_wrapped_dl(self) -> IterDataPipe:
-        dl = IterableWrapper(self.dl)
-        if self.shuffle:
-            dl = dl.shuffle(buffer_size=self.prefetch_count * self.batch_size)
-        else:
-            dl = dl.prefetch(self.prefetch_count * self.batch_size)
-        if self.batch_size > 1:
-            dl = dl.batch(self.batch_size, drop_last=True)
-        return dl
-
-    def __iter__(self) -> Iterator[Tuple[str, int, Tensor]]:
-        return iter(self.get_wrapped_dl())
-
-
-class DataModule:
-    def __init__(
-            self,
-            dataset: str,
+            distributed: bool,
+            prefetch_count: int,
+            tasks: Set[str],
             path: str,
-            frame_sampler: SampleFrames,
-            batch_size: int,
-            num_workers: int = 1,
-            prefetch_count: int = 10,
-            crop_size: int = 224
     ):
         super().__init__()
-        self.dataset = dataset
-        self.path = path
-        self.frame_sampler = frame_sampler
         self.batch_size = batch_size
-        self.num_workers = num_workers
+        self.distributed = distributed
         self.prefetch_count = prefetch_count
-        self.crop_size = crop_size
+        self.tasks = tasks
+        self.path = Path(path)
+        self.shards: Dict[str, IterDataPipe] = {}
 
-        # Not Initialized
-        self.shard_path = None
-        self.worker_transform = None
-        self.gpu_transform = None
+        # Trackers
+        self.current_epoch = 0
+        self.current_stage = None
 
-    def setup_stage(self, stage: str):
-        shard_path = os.listdir(os.path.join(self.path, self.dataset, stage))
-        self.shard_path = [os.path.join(self.path, self.dataset, stage, p) for p in shard_path]
+        # Initialized per stage
+        self.cpu_transforms: Optional[List[Callable]] = None
+        self.gpu_transform: Optional[Module] = None
+        self.dp: Optional[IterDataPipe] = None
 
-        if stage == 'train':
-            self.worker_transform = [
-                self.frame_sampler,
-                self.frame_to_tensor,
-                T.RandomCrop(self.crop_size),
-                T.RandomHorizontalFlip(),
-            ]
-        elif stage in ('val', 'test'):
-            self.worker_transform = [
-                self.frame_sampler,
-                self.frame_to_tensor,
-                T.CenterCrop(self.crop_size),
-            ]
-
-    def get_dataloader(self) -> Dataloader:
-        assert self.shard_path is not None and self.worker_transform is not None, 'Setup method has not been called!'
-        return Dataloader(
-            shards=self.shard_path,
-            batch_size=self.batch_size,
-            transforms=self.worker_transform,
-            num_workers=min(self.num_workers, len(self.shard_path)),
-            prefetch_count=self.prefetch_count
-        )
+        # Initialized once, updated per stage
+        self.train_loader: Optional[DataLoader2] = None
+        self.val_loader: Optional[DataLoader2] = None
+        self.test_loader: Optional[DataLoader2] = None
 
     @staticmethod
-    def transfer_batch_to_device(batch: Tuple[str, int, Tensor], fabric: Fabric) -> Tuple[str, int, Tensor]:
-        return batch[0], batch[1], fabric.to_device(batch[2])
+    def _batch(batch: List[Tuple[str, int, Tensor]]) -> Tuple[List, Tensor, List]:
+        keys, targets, frames = map(list, zip(*batch))
+        targets = torch.from_numpy(np.asarray(targets))
+        return keys, targets, frames
 
-    def on_after_batch_transfer(self, batch: Tuple[str, int, Tensor]) -> Tuple[str, int, Tensor]:
+    def _get_cpu_transform(self) -> List[Callable]:
+        # Implement per dataset
+        pass
+
+    def _get_gpu_transform(self) -> Module:
+        # Implement per dataset
+        pass
+
+    def _get_datapipe(self) -> IterDataPipe:
+        dp: IterDataPipe = self.shards[self.current_stage].read()
+        if self.current_stage == 'train':
+            dp = dp.shuffle(buffer_size=1000)
+        if self.distributed > 1:
+            dp = dp.sharding_filter()
+        dp = dp.spdp(transforms=self.cpu_transforms)
+        dp = dp.batch(batch_size=self.batch_size, drop_last=True, wrapper_class=self._batch)
+        if self.distributed > 1:
+            dp = dp.fullsync()
+        return dp.prefetch(self.prefetch_count)
+
+    def _define_reading_service(self) -> ReadingServiceInterface:
+        rs: Optional[ReadingServiceInterface] = None
+        if self.distributed:
+            rs = DistributedReadingService()
+        return rs
+
+    def prepare_data(self):
+        shards = {task: list((self.path / task).glob('*.tar')) for task in self.tasks}
+        self.shards = {task: IterableWrapper(shards[task]).map(str) for task in self.tasks}
+        if 'train' in self.tasks:
+            self.shards['train'] = self.shards['train'].shuffle(buffer_size=len(shards['train']))
+
+    def setup(self, stage: str):
+        if stage not in self.tasks:
+            return
+
+        if stage == 'fit':
+            self.current_epoch += 1
+
+        self.current_stage = stage
+
+        if type(self)._get_cpu_transform != BaseDataModule._get_cpu_transform:
+            self.cpu_transforms = self._get_cpu_transform()
+        if type(self)._get_gpu_transform != BaseDataModule._get_gpu_transform:
+            self.gpu_transform = self._get_gpu_transform()
+
+        self.dp = self._get_datapipe()
+
+    def on_after_batch_transfer(self, batch: Tuple[List, Tensor, List], dataloader_idx: int
+                                ) -> Tuple[List, Tensor, List]:
+        key, target, frames = batch
         if self.gpu_transform is not None:
-            batch = self.gpu_transform(batch[2])
-        return batch
+            frames = [self.gpu_transform(frame) for frame in frames]
+            frames = torch.stack(frames)
+        return key, target, frames
+
+    def train_dataloader(self) -> DataLoader2:
+        if self.train_loader is None:
+            self.train_loader = DataLoader2(self.dp, reading_service=self._define_reading_service())
+        self.train_loader.seed(self.current_epoch)
+        return self.train_loader
+
+    def val_dataloader(self) -> DataLoader2:
+        if self.val_loader is None:
+            self.val_loader = DataLoader2(self.dp, reading_service=self._define_reading_service())
+        return self.val_loader
+
+    def test_dataloader(self) -> DataLoader2:
+        if 'test' in self.tasks:
+            if self.test_loader is None:
+                self.test_loader = DataLoader2(self.dp, reading_service=self._define_reading_service())
+            return self.test_loader
+
+
+class SSv2(BaseDataModule):
+    def __init__(
+            self,
+            batch_size: int,
+            distributed: bool,
+            prefetch_count: int,
+            path: str,
+            tasks: Set[str] = {'fit'},
+    ):
+        super().__init__(
+            batch_size=batch_size,
+            distributed=distributed,
+            prefetch_count=prefetch_count,
+            tasks=tasks,
+            path=path,
+        )
+        self.num_frames = 30
+        self.short_side = 240
+        self.crop_size = 224
+
+    def _get_cpu_transform(self) -> List[Callable]:
+        if self.current_stage == 'fit':
+            transform = [
+                SampleFrames(self.num_frames, 'random'),
+                DecodeFrames(),
+                T.RandomCrop(self.short_side),
+                T.Resize(self.crop_size),
+                T.RandomHorizontalFlip(),
+            ]
+        else:
+            transform = [
+                SampleFrames(self.num_frames, 'uniform'),
+                DecodeFrames(),
+                T.CenterCrop(self.short_side),
+                T.Resize(self.crop_size),
+            ]
+        return transform
+
+    def _get_gpu_transform(self) -> Module:
+        transform = None
+        if self.current_stage == 'fit':
+            transform = Sequential(
+                T.RandAugment(),
+                T.Normalize(*norm_info['ssv2']),
+            )
+        return transform
