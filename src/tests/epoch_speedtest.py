@@ -1,5 +1,4 @@
 import os
-from typing import Optional, Literal
 
 import lightning as L
 import torch
@@ -14,14 +13,13 @@ class BaseModule(L.LightningModule):
         self.temp = nn.Parameter(torch.randn(1))
 
     def training_step(self, batch, batch_idx):
-        return Literal
+        return
 
     def configure_optimizers(self):
         return None
 
 
-if __name__ == '__main__':
-    os.chdir(os.path.expanduser('/home/lei/Documents/RedunMin/data'))
-    data = SSv2(64, True, 10, 'ssv2')
-    trainer = L.Trainer(accelerator='gpu', strategy='ddp', fast_dev_run=True)
-    trainer.fit(BaseModule(), datamodule=data)
+path = os.path.join(os.environ['SM_CHANNEL_TRAINING'], 'ssv2')
+data = SSv2(64, True, 10, path, True)
+trainer = L.Trainer(accelerator='gpu', strategy='ddp', devices=2, max_epochs=1)
+trainer.fit(BaseModule(), datamodule=data)

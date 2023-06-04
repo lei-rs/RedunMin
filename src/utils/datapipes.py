@@ -25,7 +25,6 @@ class Sequential(IterDataPipe):
 class ReadToMemory(IterDataPipe):
     def __init__(self, datapipe: IterDataPipe):
         self.datapipe = datapipe
-        print(datapipe)
 
     @staticmethod
     def _decode(item):

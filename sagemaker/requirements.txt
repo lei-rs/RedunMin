@@ -1,0 +1,4 @@
+imagecodecs[all]
+torchdata
+torchvision
+lightning
