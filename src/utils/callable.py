@@ -1,10 +1,9 @@
 from typing import Dict, Literal
 
 import numpy as np
+import concurrent.futures
 from imagecodecs import jpeg_decode
-from numpy import stack, uint8
 from torch import Tensor, from_numpy
-
 from .constants import NUM_FRAMES, FRAME
 
 
@@ -41,5 +40,7 @@ class SampleFrames:
 
 class DecodeFrames:
     def __call__(self, sample: Dict) -> Tensor:
-        images = [bytes(sample[FRAME.format(i)]) for i in range(sample[NUM_FRAMES])]
-        return from_numpy(stack([jpeg_decode(image) for image in images], dtype=uint8)).permute(0, 3, 1, 2).contiguous()
+        images = [sample[FRAME.format(i)] for i in range(sample[NUM_FRAMES])]
+        with concurrent.futures.ThreadPoolExecutor(4) as executor:
+            images = list(executor.map(jpeg_decode, images))
+        return from_numpy(np.stack(images)).permute(0, 3, 1, 2).contiguous()

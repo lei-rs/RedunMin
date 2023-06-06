@@ -1,6 +1,7 @@
 from typing import List, Dict, Callable, Iterator, Tuple
 
-from torch import Tensor
+from numpy import frombuffer
+from torch import Tensor, from_numpy
 from torchdata.datapipes import functional_datapipe
 from torchdata.datapipes.iter import IterDataPipe, FileOpener
 
@@ -32,7 +33,7 @@ class ReadToMemory(IterDataPipe):
         if key.endswith('.cls') or key.endswith(NUM_FRAMES):
             value = int(value.read())
         elif key.endswith('.jpeg'):
-            value = value.read()
+            value = bytes(value.read())
         return key, value
 
     @staticmethod

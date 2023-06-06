@@ -1,4 +1,3 @@
-import os
 import random
 from pathlib import Path
 from typing import List, Callable, Optional, Tuple, Dict, Set
@@ -11,6 +10,8 @@ from torch import Tensor
 from torch.nn import Module, Sequential
 from torchdata.dataloader2 import DistributedReadingService, DataLoader2, ReadingServiceInterface
 from torchdata.datapipes.iter import IterDataPipe, IterableWrapper
+from torch.utils.data.datapipes.iter.sharding import SHARDING_PRIORITIES
+
 
 from .callable import SampleFrames, DecodeFrames
 
@@ -71,10 +72,10 @@ class BaseDataModule(LightningDataModule):
 
     def _get_datapipe(self, task: str, transforms: List[Callable]) -> IterDataPipe:
         dp: IterDataPipe = IterableWrapper(self.shards[task]).read()
+        if self.distributed > 1:
+            dp = dp.sharding_round_robin_dispatch(SHARDING_PRIORITIES.MULTIPROCESSING).sharding_filter()
         if task == 'train':
             dp = dp.shuffle(buffer_size=1000)
-        if self.distributed > 1:
-            dp = dp.sharding_filter()
         dp = dp.spdp(transforms=transforms)
         dp = dp.batch(batch_size=self.batch_size, drop_last=True, wrapper_class=self._batch)
         if self.distributed > 1:
@@ -156,24 +157,24 @@ class SSv2(BaseDataModule):
             'train': [
                 SampleFrames(self.num_frames, 'random'),
                 DecodeFrames(),
-                T.RandomCrop(self.short_side),
-                T.Resize(self.crop_size),
-                T.RandomHorizontalFlip(),
             ],
             'val': [
                 SampleFrames(self.num_frames, 'uniform'),
                 DecodeFrames(),
-                T.CenterCrop(self.short_side),
-                T.Resize(self.crop_size),
             ]
         }
         self.gpu_transforms = {
             'train': Sequential(
+                    T.RandomCrop(self.short_side),
+                    T.Resize(self.crop_size),
+                    T.RandomHorizontalFlip(),
                     T.RandAugment(),
                     T.ConvertImageDtype(torch.float32),
                     T.Normalize(*norm_info['ssv2']),
             ),
             'val': Sequential(
+                    T.CenterCrop(self.short_side),
+                    T.Resize(self.crop_size),
                     T.ConvertImageDtype(torch.float32),
                     T.Normalize(*norm_info['ssv2']),
             )

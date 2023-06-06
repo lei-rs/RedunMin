@@ -1,4 +1,5 @@
-imagecodecs[all]
+pynvjpeg
 torchdata
 torchvision
 lightning
+numpy

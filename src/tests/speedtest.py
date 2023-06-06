@@ -1,17 +1,15 @@
 import os
-from src import utils as U
 import time
 
+from src.utils import SSv2
 
-ffm = os.environ['SM_CHANNEL_TRAINING']
-path = [os.path.join(ffm, f'ssv2/train/shard_{i:06d}.tar') for i in range(47)]
 
-transforms = [
-    U.SampleFrames(128, 'uniform'),
-    U.ReadFrames(),
-]
+path = os.path.join(os.environ['SM_CHANNEL_TRAINING'], 'ssv2')
+dm = SSv2(64, False, 10, 'ssv2')
+dm.prepare_data()
+dm.setup('train')
+dl = dm.train_dataloader()
 
-dl = U.Dataloader(path, batch_size=1, num_workers=4, transforms=transforms, prefetch_count=8).dl
 
 start = time.time()
 for i, batch in enumerate(dl):
