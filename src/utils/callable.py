@@ -7,14 +7,6 @@ from torch import Tensor, from_numpy
 from .constants import NUM_FRAMES, FRAME
 
 
-class ToDevice:
-    def __init__(self, device: str = 'cpu'):
-        self.device = device
-
-    def __call__(self, x: Tensor) -> Tensor:
-        return x.to(self.device)
-
-
 class SampleFrames:
     def __init__(self, num_frames: int, mode: Literal['random', 'uniform'] = 'random'):
         self.frames_out = num_frames
@@ -39,8 +31,17 @@ class SampleFrames:
 
 
 class DecodeFrames:
+    def __init__(self):
+        self.executor = None
+
+    def teardown(self):
+        if self.executor is not None:
+            self.executor.shutdown()
+            self.executor = None
+
     def __call__(self, sample: Dict) -> Tensor:
+        if self.executor is None:
+            self.executor = concurrent.futures.ThreadPoolExecutor(2)
         images = [sample[FRAME.format(i)] for i in range(sample[NUM_FRAMES])]
-        with concurrent.futures.ThreadPoolExecutor(4) as executor:
-            images = list(executor.map(jpeg_decode, images))
+        images = list(self.executor.map(jpeg_decode, images))
         return from_numpy(np.stack(images)).permute(0, 3, 1, 2).contiguous()

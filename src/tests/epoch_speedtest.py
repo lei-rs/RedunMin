@@ -20,8 +20,8 @@ class BaseModule(L.LightningModule):
 
 
 if __name__ == '__main__':
-    path = os.path.join(os.environ['SM_CHANNEL_TRAINING'], 'ssv2')
-    #path = '/home/lei/Documents/RedunMin/data/ssv2'
-    data = SSv2(64, True, 10, path, True)
-    trainer = L.Trainer(accelerator='gpu', strategy='ddp', devices=4, max_epochs=1)
+    #path = os.path.join(os.environ['SM_CHANNEL_TRAINING'], 'ssv2')
+    path = 'C:\\Users\leifu\Documents\GitHub\RedunMin\data\ssv2'
+    data = SSv2(64, True, 10, False, path)
+    trainer = L.Trainer(accelerator='cpu', devices=2, strategy='ddp', max_epochs=1)
     trainer.fit(BaseModule(), datamodule=data)

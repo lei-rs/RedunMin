@@ -8,6 +8,7 @@ from torchdata.datapipes.iter import IterDataPipe, FileOpener
 from .constants import NUM_FRAMES, TARGET
 
 
+@functional_datapipe('seq')
 class Sequential(IterDataPipe):
     def __init__(self, datapipe: IterDataPipe, callables: List[Callable]):
         self.datapipe = datapipe
@@ -19,11 +20,21 @@ class Sequential(IterDataPipe):
         return item
 
     def __iter__(self) -> Iterator[IterDataPipe]:
-        return iter(self.datapipe.map(self._call))
+        yield from self.datapipe.map(self._call)
+
+
+@functional_datapipe('wds')
+class TarToWDS(IterDataPipe):
+    def __init__(self, datapipe: IterDataPipe):
+        self.datapipe = datapipe
+
+    def __iter__(self) -> Iterator[IterDataPipe]:
+        dp = FileOpener(self.datapipe, mode='rb').load_from_tar().webdataset()
+        yield from dp
 
 
 @functional_datapipe('read')
-class ReadToMemory(IterDataPipe):
+class ReadStream(IterDataPipe):
     def __init__(self, datapipe: IterDataPipe):
         self.datapipe = datapipe
 
@@ -36,15 +47,15 @@ class ReadToMemory(IterDataPipe):
             value = bytes(value.read())
         return key, value
 
-    @staticmethod
-    def _split_key(sample: Dict) -> Dict:
+    def _decode_sample(self, sample: Dict) -> Dict:
         sample['__key__'] = sample['__key__'].split('/')[-1]
+        for i in sample.items():
+            k, v = self._decode(i)
+            sample[k] = v
         return sample
 
     def __iter__(self) -> Iterator[IterDataPipe]:
-        dp = FileOpener(self.datapipe, mode='rb').load_from_tar().map(self._decode).webdataset()
-        for sample in dp:
-            yield self._split_key(sample)
+        yield from self.datapipe.map(self._decode_sample)
 
 
 class SplitWDSample(IterDataPipe):
@@ -58,7 +69,7 @@ class SplitWDSample(IterDataPipe):
         return key, target, sample
 
     def __iter__(self) -> Iterator[IterDataPipe[Tuple[str, int, Dict]]]:
-        return iter(self.datapipe.map(self._split).unzip(3))
+        yield from self.datapipe.map(self._split).unzip(3)
 
 
 @functional_datapipe('spdp')
@@ -70,4 +81,4 @@ class SingleProcDP(IterDataPipe):
         self.pipe_out = keys.zip(targets, images)
 
     def __iter__(self) -> Iterator[Tuple[str, int, Tensor]]:
-        return iter(self.pipe_out)
+        yield from self.pipe_out
