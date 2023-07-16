@@ -1,19 +1,20 @@
 import random
 from pathlib import Path
-from typing import List, Callable, Optional, Tuple, Dict, Set
+from typing import List, Callable, Optional, Tuple, Dict
 
 import numpy as np
 import torchvision.transforms as T
-import torch.distributed as dist
 from lightning import LightningDataModule
-from torch import Tensor, from_numpy, stack, float32
+from torch import Tensor, from_numpy, float32
 from torch.nn import Module, Sequential
-from torch.utils.data.graph_settings import apply_sharding
+from torch.utils.data.datapipes.iter.sharding import SHARDING_PRIORITIES
 from torchdata.dataloader2 import DistributedReadingService, DataLoader2, ReadingServiceInterface
 from torchdata.datapipes.iter import IterDataPipe, IterableWrapper
-from torch.utils.data.datapipes.iter.sharding import SHARDING_PRIORITIES
+from torchvision.transforms import InterpolationMode
 
 from .callable import SampleFrames, DecodeFrames
+from .dispatcher import dispatch_worker
+
 
 norm_info = {
     'ssv2': ([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
@@ -59,10 +60,11 @@ class BaseDataModule(LightningDataModule):
         self.test_loader: Optional[DataLoader2] = None
 
     @staticmethod
-    def _batch(batch: List[Tuple[str, int, Tensor]]) -> Tuple[List, Tensor, List]:
-        keys, targets, frames = map(list, zip(*batch))
+    def _batch(batch: List[Tuple[int, Tensor]]) -> Tuple[Tensor, Tensor]:
+        targets, frames = map(list, zip(*batch))
         targets = from_numpy(np.asarray(targets))
-        return keys, targets, frames
+        frames = from_numpy(np.stack([frame.numpy() for frame in frames]))
+        return targets, frames
 
     def _update_cpu_transform(self) -> List[Callable]:
         # If you want to update per stage
@@ -73,21 +75,18 @@ class BaseDataModule(LightningDataModule):
         pass
 
     def _get_datapipe(self, task: str, transforms: List[Callable]) -> IterDataPipe:
-        dp: IterableWrapper = IterableWrapper(self.shards[task]).wds()
+        dp: IterDataPipe = IterableWrapper(self.shards[task]).wds().read()
         if task == 'train':
             dp = dp.shuffle(buffer_size=10)
         if self.distributed:
             dp = (
                 dp
-                .sharding_filter(SHARDING_PRIORITIES.MULTIPROCESSING)
+                .sharding_filter(SHARDING_PRIORITIES.DISTRIBUTED)
                 .sharding_round_robin_dispatch(SHARDING_PRIORITIES.MULTIPROCESSING)
             )
-        dp = dp.read()
-        dp = dp.spdp(transforms=transforms)
+        dp = dp.seq(transforms)
         dp = dp.batch(batch_size=self.batch_size, drop_last=True, wrapper_class=self._batch)
-        if self.distributed:
-            dp = dp.fullsync()
-        return dp.prefetch(self.prefetch_count)
+        return dp
 
     def _define_reading_service(self) -> ReadingServiceInterface:
         rs: Optional[ReadingServiceInterface] = None
@@ -100,8 +99,6 @@ class BaseDataModule(LightningDataModule):
             random.Random(self.seed + self.current_epoch).shuffle(self.shards['train'])
         transforms = self.cpu_transforms[self.current_stage]
         dp = self._get_datapipe(self.current_stage, transforms)
-        if self.distributed:
-            dp = apply_sharding(dp, dist.get_world_size(), dist.get_rank(), SHARDING_PRIORITIES.MULTIPROCESSING)
         return DataLoader2(dp, reading_service=self._define_reading_service())
 
     def stage(self, stage: str):
@@ -113,13 +110,13 @@ class BaseDataModule(LightningDataModule):
         if type(self)._update_gpu_transform is not BaseDataModule._update_gpu_transform:
             self.gpu_transforms = self._update_gpu_transform()
 
-    def on_after_batch_transfer(self, batch: Tuple[List, Tensor, List], dataloader_idx: int) -> Tuple[List, Tensor, Tensor]:
-        key, target, frames = batch
-        transform = self.gpu_transforms[self.current_stage]
-        if transform is not None:
-            frames = [transform(frame) for frame in frames]
-        frames = stack(frames)
-        return key, target, frames
+    def on_after_batch_transfer(self, batch: Tuple[Tensor, Tensor], dataloader_idx: int) -> Tuple[Tensor, Tensor]:
+        target, frames = batch
+        if self.current_stage in self.gpu_transforms:
+            transform = self.gpu_transforms[self.current_stage]
+            for i in range(len(frames)):
+                frames[i] = transform(frames[i])
+        return target, frames
 
     def train_dataloader(self) -> DataLoader2:
         self.current_stage = 'train'
@@ -150,6 +147,8 @@ class SSv2(BaseDataModule):
             'train': [
                 SampleFrames(self.num_frames, 'random'),
                 DecodeFrames(),
+                T.RandomCrop(self.short_side),
+                T.Resize(size=self.crop_size, interpolation=InterpolationMode.BILINEAR, antialias=True),
             ],
             'val': [
                 SampleFrames(self.num_frames, 'uniform'),
@@ -158,8 +157,6 @@ class SSv2(BaseDataModule):
         }
         self.gpu_transforms = {
             'train': Sequential(
-                T.RandomCrop(self.short_side),
-                T.Resize(self.crop_size),
                 T.RandomHorizontalFlip(),
                 T.RandAugment(),
                 T.ConvertImageDtype(float32),

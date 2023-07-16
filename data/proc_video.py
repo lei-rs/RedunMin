@@ -89,7 +89,7 @@ def _create_sample(vid_path: pathlib.Path, vid_name: str, int_label: str):
             if h > 240:
                 frame = frame.resize((int(w * 240 / h), 240))
             frame_bytes = io.BytesIO()
-            frame.save(frame_bytes, format='JPEG', quality=85, optimize=True)
+            frame.save(frame_bytes, format='JPEG2000', quality=85, optimize=True)
             frame.close()
             sample[f'frame_{i:06d}.jpeg'] = frame_bytes.getvalue()
             num_frames += 1

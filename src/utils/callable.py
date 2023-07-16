@@ -1,10 +1,18 @@
-from typing import Dict, Literal
+from multiprocessing.shared_memory import ShareableList
+from typing import Literal, Tuple, List
+from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
-import concurrent.futures
+from numpy.typing import NDArray
 from imagecodecs import jpeg_decode
-from torch import Tensor, from_numpy
-from .constants import NUM_FRAMES, FRAME
+
+
+def copy_shared_list(sample: List):
+    key, target, l = sample
+    ar = np.copy(l)
+    l.shm.close()
+    l.shm.unlink()
+    return key, target, ar
 
 
 class SampleFrames:
@@ -12,36 +20,37 @@ class SampleFrames:
         self.frames_out = num_frames
         self.mode = mode
 
-    def __call__(self, sample: Dict) -> Dict:
-        num_frames = sample[NUM_FRAMES]
+    @staticmethod
+    def _sample(frames_out: int, frames: NDArray, mode: Literal['random', 'uniform']) -> NDArray:
+        num_frames = len(frames)
+        if frames_out > num_frames:
+            last = [frames[-1]] * (frames_out - num_frames)
+            return np.append(frames, last)
 
-        if self.frames_out > num_frames:
-            for i in range(num_frames, self.frames_out):
-                sample[FRAME.format(i)] = sample[FRAME.format(num_frames - 1)]
-            num_frames = self.frames_out
-
-        indices = np.linspace(0, num_frames, self.frames_out + 1, dtype=int)
-        if self.mode == 'random':
-            indices = [np.random.randint(indices[i], indices[i + 1]) for i in range(self.frames_out)]
-        elif self.mode == 'uniform':
+        indices = np.linspace(0, num_frames, frames_out + 1, dtype=int)
+        if mode == 'random':
+            indices = np.random.randint(indices[:-1], indices[1:], frames_out)
+        elif mode == 'uniform':
             indices = indices[:-1]
-        ret = {FRAME.format(i): sample[FRAME.format(idx)] for i, idx in enumerate(indices)}
-        ret[NUM_FRAMES] = self.frames_out
-        return ret
+        return frames[indices]
+
+    def __call__(self, sample: Tuple[str, int, NDArray]) -> Tuple[str, int, NDArray]:
+        key, target, frames = sample
+        frames = self._sample(self.frames_out, frames, self.mode)
+        return key, target, frames
 
 
 class DecodeFrames:
     def __init__(self):
-        self.executor = None
+        self.pool = None
 
-    def teardown(self):
-        if self.executor is not None:
-            self.executor.shutdown()
-            self.executor = None
+    def _start_pool(self):
+        self.pool = ThreadPoolExecutor(4)
 
-    def __call__(self, sample: Dict) -> Tensor:
-        if self.executor is None:
-            self.executor = concurrent.futures.ThreadPoolExecutor(2)
-        images = [sample[FRAME.format(i)] for i in range(sample[NUM_FRAMES])]
-        images = list(self.executor.map(jpeg_decode, images))
-        return from_numpy(np.stack(images)).permute(0, 3, 1, 2).contiguous()
+    def __call__(self, sample: Tuple[str, int, NDArray[bytes]]) -> Tuple[str, int, NDArray]:
+        if self.pool is None:
+            self._start_pool()
+        key, target, frames = sample
+        frames = list(self.pool.map(jpeg_decode, frames))
+        frames = np.asarray(frames, dtype=np.uint8).transpose((3, 0, 1, 2))
+        return key, target, frames
