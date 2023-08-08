@@ -1,35 +1,38 @@
-import av
-import io
 import gc
 import json
+import os
 import pathlib
-import random
-import numpy as np
-import pandas as pd
-import webdataset as wds
-from PIL import Image
-from tqdm import tqdm
-from multiprocessing import Pool, Queue
+from typing import Dict
 
+import av
+import pandas as pd
+from bounded_pool_executor import BoundedProcessPoolExecutor
+from pydantic import BaseModel
+from tqdm import tqdm
 
 DATASET = 'ssv2'
-VID_EXT = 'webm'
-outputs = Queue(maxsize=100)
+
+
+class SampleMetadata(BaseModel):
+    key: str
+    cls: str
+    subset: str
+    annotations: dict
 
 
 class VideoMetadata:
     def __init__(self):
-        self.md = {}
+        self.md: Dict[SampleMetadata] = {}
         self.int_labels = {}
 
-    def get_info(self, vid_name):
+    def get_info(self, key) -> SampleMetadata:
         try:
-            md = self.md[vid_name]
-            label = md['annotations']['label']
-            int_label = self.int_labels[label]
+            md = self.md[key]
+            md['key'] = key
+            md['cls'] = self.int_labels[md['annotations']['label']]
+            return SampleMetadata(**md)
         except KeyError:
-            raise Exception(f'Missing metadata for {vid_name}')
-        return md, int_label
+            raise Exception(f'Missing metadata for {key}')
 
 
 class KineticsMetadata(VideoMetadata):
@@ -44,11 +47,11 @@ class KineticsMetadata(VideoMetadata):
 class SSV2Metadata(VideoMetadata):
     def __init__(self, dataset):
         super().__init__()
-        self.md_path = pathlib.Path.cwd() / 'metadata'
+        self.md_path = pathlib.Path.cwd()
         train = json.load(open(str(self.md_path / f'{dataset}/train.json'), 'r'))
         val = json.load(open(str(self.md_path / f'{dataset}/val.json'), 'r'))
-        test = json.load(open(str(self.md_path / f'{dataset}/tests.json'), 'r'))
-        test_ans = pd.read_csv(str(self.md_path / f'{dataset}/tests-answers.csv'), header=None, index_col=0, delimiter=';')
+        test = json.load(open(str(self.md_path / f'{dataset}/test.json'), 'r'))
+        test_ans = pd.read_csv(str(self.md_path / f'{dataset}/test-answers.csv'), header=None, index_col=0, delimiter=';')
         self.int_labels = json.load(open(str(self.md_path / f'{dataset}/labels.json'), 'r'))
 
         for entry in train:
@@ -75,118 +78,111 @@ class SSV2Metadata(VideoMetadata):
 vmd = SSV2Metadata(DATASET)
 
 
-def _create_sample(vid_path: pathlib.Path, vid_name: str, int_label: str):
-    sample = {'__key__': f'{vid_name}'}
+def _new_output(out_path, width, height):
+    output_container = av.open(out_path, 'wb')
+    output_stream = output_container.add_stream(
+        'h264',
+        rate=30,
+        options={
+            'preset': 'veryslow',
+            'tune': 'fastdecode'
+        }
+    )
+    output_stream.pix_fmt = 'yuv420p'
+    output_stream.width = width
+    output_stream.height = height
+    return output_container, output_stream
+
+
+def _calc_new_dims(width, height, short_edge=224):
+    if width < height:
+        new_width = short_edge
+        new_height = int(height * short_edge / width)
+        if new_height % 2 != 0:
+            new_height += 1
+    else:
+        new_height = short_edge
+        new_width = int(width * short_edge / height)
+        if new_width % 2 != 0:
+            new_width += 1
+    return new_width, new_height
+
+
+def _resize_video(input_path: str, out_path: str):
     num_frames = 0
+    input_container = av.open(input_path)
+    output_container, output_stream = None, None
 
-    with av.open(str(vid_path)) as container:
-        stream = container.streams.video[0]
-        for i, frame in enumerate(container.decode(stream)):
-            frame = frame.to_image()
-            if np.isnan(np.asarray(frame)).any():
-                raise Exception('Frame is None')
-            h, w = frame.size
-            if h > 240:
-                frame = frame.resize((int(w * 240 / h), 240))
-            frame_bytes = io.BytesIO()
-            frame.save(frame_bytes, format='JPEG2000', quality=85, optimize=True)
-            frame.close()
-            sample[f'frame_{i:06d}.jpeg'] = frame_bytes.getvalue()
-            num_frames += 1
+    for i, frame in enumerate(input_container.decode(video=0)):
+        w, h = _calc_new_dims(frame.width, frame.height)
+        if output_container is None:
+            output_container, output_stream = _new_output(out_path, w, h)
 
-    if num_frames == 0:
-        raise Exception('No frames in video')
+        frame = frame.reformat(
+            width=w,
+            height=h,
+            format='rgb24',
+            interpolation=av.video.reformatter.Interpolation.LANCZOS
+        )
 
-    sample['target.cls'] = str(int_label).encode('ascii')
-    sample['num_frames'] = str(num_frames).encode('ascii')
+        for packet in output_stream.encode(frame):
+            output_container.mux(packet)
 
-    gc.collect()
+        num_frames += 1
 
-    return sample
+    for packet in output_stream.encode():
+        output_container.mux(packet)
+
+    input_container.close()
+    output_container.close()
+    return num_frames
 
 
-def _process_task(vid_path: pathlib.Path):
+def _process_task(vid_path: pathlib.Path, out_path: str):
     vid_name = vid_path.stem
     try:
-        md, int_label = vmd.get_info(vid_name)
-        sample = _create_sample(vid_path, vid_name, int_label)
-        outputs.put((sample, vid_name, md), block=True)
-
+        md = vmd.get_info(vid_name)
+        key = md.key
+        sample_path = f'{out_path}/{md.subset}/{key}'
+        os.makedirs(sample_path, exist_ok=True)
+        assert _resize_video(
+            str(vid_path),
+            f'{sample_path}/vid.mp4'
+        ) > 0, f'Empty video {vid_name}'
+        gc.collect()
+        with open(f'{sample_path}/md.json', 'w') as f:
+            json.dump(md.model_dump_json(), f)
+        return
     except Exception as e:
-        outputs.put((e, vid_name, None), block=True)
+        print(f'Error processing {vid_name}: {e}')
 
 
 class VideoToWebdataset:
-    def __init__(self, dataset,  verbose=False):
-        self.dataset = dataset
+    def __init__(self, input_path, output_path,  verbose=False):
+        self.output_path = pathlib.Path(output_path)
         self.verbose = verbose
 
-        input_path = pathlib.Path.cwd() / dataset
-        output_path = pathlib.Path.cwd() / f'{dataset}_out'
-        self.md_out_path = output_path / 'metadata'
+        self.md_out_path = self.output_path / 'metadata'
         self.md_out_path.mkdir(parents=True, exist_ok=True)
-        self.file_paths = list(pathlib.Path(input_path).rglob(f'*.{VID_EXT}'))
-        random.shuffle(self.file_paths)
+        self.file_paths = list(pathlib.Path(input_path).rglob('*'))
+        self.error_log = ['id error']
 
-        self.error_log = ['id path error']
-        self.counts = {label: 0 for label in vmd.int_labels.keys()}
-
-        (output_path / 'train').mkdir(parents=True, exist_ok=True)
-        (output_path / 'val').mkdir(parents=True, exist_ok=True)
-        (output_path / 'tests').mkdir(parents=True, exist_ok=True)
-
-        self.writers = {
-            'train': wds.ShardWriter(str(output_path / f'train/shard_%06d.tar'), maxcount=5000, maxsize=2.5e9, encoder=False),
-            'val': wds.ShardWriter(str(output_path / f'val/shard_%06d.tar'), maxcount=5000, maxsize=2.5e9, encoder=False),
-            'tests': wds.ShardWriter(str(output_path / f'tests/shard_%06d.tar'), maxcount=5000, maxsize=2.5e9, encoder=False),
-        }
-
-    def _dump_counts(self):
-        counter = {
-            'missing': len(self.error_log) - 1,
-            'labels': self.counts
-        }
-
-        with open(str(self.md_out_path / f'counts.json'), 'w') as f:
-            json.dump(counter, f, indent=4)
+        for path in ['train', 'val', 'tests']:
+            (self.output_path / path).mkdir(parents=True, exist_ok=True)
 
     def _write_error_log(self):
         with open(str(self.md_out_path / f'errors.log'), 'w') as f:
             f.write('\n'.join(self.error_log))
 
-    def _write_to_subset(self, sample, subset):
-        self.writers[subset].write(sample)
-
-    def _close_writers(self):
-        for writer in self.writers.values():
-            writer.close()
-
-    def __call__(self, n_jobs):
-        p = Pool(n_jobs - 1)
-        p.map_async(_process_task, self.file_paths, chunksize=64)
-        pbar = tqdm(range(len(self.file_paths)), total=len(self.file_paths), mininterval=1)
-
-        for _ in pbar:
-            sample, vid_name, md = outputs.get(block=True, timeout=100)
-
-            if md is None:
-                if self.verbose:
-                    print(vid_name, sample)
-                self.error_log.append(f'{vid_name} \'{str(sample)}\'')
-                pbar.set_description(f'Missing {len(self.error_log) - 1} videos')
-
-            else:
-                label = md['annotations']['label']
-                split = md['subset']
-                self._write_to_subset(sample, split)
-                self.counts[label] += 1
-
-        p.close()
-        p.join()
-        self._close_writers()
-        self._dump_counts()
-        self._write_error_log()
+    def start(self, n_jobs):
+        executor = BoundedProcessPoolExecutor(max_workers=n_jobs)
+        for path in tqdm(self.file_paths):
+            executor.submit(_process_task, path, self.output_path)
 
 
 if __name__ == '__main__':
-    VideoToWebdataset(DATASET, verbose=True)(31)
+    VideoToWebdataset(
+        'rawdata',
+        'data_out',
+        verbose=True
+    ).start(32)
