@@ -1,16 +1,16 @@
 import gc
+import io
 import json
-import os
 import pathlib
+from multiprocessing import Pool, Queue
 from typing import Dict
 
 import av
 import pandas as pd
-from bounded_pool_executor import BoundedProcessPoolExecutor
+import pickle
 from pydantic import BaseModel
 from tqdm import tqdm
-
-DATASET = 'ssv2'
+from rand_archive import Writer
 
 
 class SampleMetadata(BaseModel):
@@ -75,17 +75,18 @@ class SSV2Metadata(VideoMetadata):
         }
 
 
-vmd = SSV2Metadata(DATASET)
+q = Queue(200)
+vmd = SSV2Metadata('ssv2')
 
 
 def _new_output(out_path, width, height):
-    output_container = av.open(out_path, 'wb')
+    output_container = av.open(out_path, 'wb', 'h264')
     output_stream = output_container.add_stream(
         'h264',
         rate=30,
         options={
-            'preset': 'veryslow',
-            'tune': 'fastdecode'
+            'tune': 'fastdecode',
+            'crf': '28',
         }
     )
     output_stream.pix_fmt = 'yuv420p'
@@ -108,20 +109,21 @@ def _calc_new_dims(width, height, short_edge=224):
     return new_width, new_height
 
 
-def _resize_video(input_path: str, out_path: str):
+def _resize_video(input_path: str):
     num_frames = 0
     input_container = av.open(input_path)
+    output = io.BytesIO()
     output_container, output_stream = None, None
 
     for i, frame in enumerate(input_container.decode(video=0)):
         w, h = _calc_new_dims(frame.width, frame.height)
         if output_container is None:
-            output_container, output_stream = _new_output(out_path, w, h)
+            output_container, output_stream = _new_output(output, w, h)
 
         frame = frame.reformat(
             width=w,
             height=h,
-            format='rgb24',
+            format='yuv420p',
             interpolation=av.video.reformatter.Interpolation.LANCZOS
         )
 
@@ -135,26 +137,19 @@ def _resize_video(input_path: str, out_path: str):
 
     input_container.close()
     output_container.close()
-    return num_frames
+    return num_frames, output
 
 
-def _process_task(vid_path: pathlib.Path, out_path: str):
+def _process_task(vid_path: pathlib.Path):
     vid_name = vid_path.stem
     try:
         md = vmd.get_info(vid_name)
-        key = md.key
-        sample_path = f'{out_path}/{md.subset}/{key}'
-        os.makedirs(sample_path, exist_ok=True)
-        assert _resize_video(
-            str(vid_path),
-            f'{sample_path}/vid.mp4'
-        ) > 0, f'Empty video {vid_name}'
+        out = _resize_video(str(vid_path))
+        assert out[0] > 0, f'Empty video {vid_name}'
         gc.collect()
-        with open(f'{sample_path}/md.json', 'w') as f:
-            json.dump(md.model_dump_json(), f)
-        return
+        return q.put([out[1].getvalue(), md], block=True)
     except Exception as e:
-        print(f'Error processing {vid_name}: {e}')
+        return q.put([e, vid_name], block=True)
 
 
 class VideoToWebdataset:
@@ -167,17 +162,59 @@ class VideoToWebdataset:
         self.file_paths = list(pathlib.Path(input_path).rglob('*'))
         self.error_log = ['id error']
 
-        for path in ['train', 'val', 'tests']:
-            (self.output_path / path).mkdir(parents=True, exist_ok=True)
+        self.writers = {
+            'train': Writer(
+                str(self.output_path / 'train.raa'),
+                max_header_size=10_000_000,
+            ),
+            'val': Writer(
+                str(self.output_path / 'val.raa'),
+                max_header_size=1_000_000,
+            ),
+            'tests': Writer(
+                str(self.output_path / 'tests.raa'),
+                max_header_size=1_000_000,
+            ),
+        }
 
     def _write_error_log(self):
         with open(str(self.md_out_path / f'errors.log'), 'w') as f:
             f.write('\n'.join(self.error_log))
 
+    def _write_to_subset(self, key, sample, subset):
+        assert len(sample) > 0, f'Empty sample {key} {subset}'
+        self.writers[subset].write(key, sample)
+
+    def _close_writers(self):
+        for writer in self.writers.values():
+            writer.close()
+
     def start(self, n_jobs):
-        executor = BoundedProcessPoolExecutor(max_workers=n_jobs)
-        for path in tqdm(self.file_paths):
-            executor.submit(_process_task, path, self.output_path)
+        p = Pool(n_jobs - 1)
+        p.map_async(_process_task, self.file_paths, chunksize=64)
+        pbar = tqdm(range(len(self.file_paths)), total=len(self.file_paths), mininterval=1)
+
+        for _ in pbar:
+            out = q.get(block=True, timeout=100)
+
+            if out[1] is str:
+                e, vid_name = out
+                self.error_log.append(f'{vid_name} {str(e)}')
+                if self.verbose:
+                    print(f'Error processing {vid_name}: {str(e)}')
+
+            else:
+                raw, md = out
+                sample = {
+                    'md': dict(md),
+                    'video': raw,
+                }
+                self._write_to_subset(md.key, pickle.dumps(sample), md.subset)
+
+        p.close()
+        p.join()
+        self._close_writers()
+        self._write_error_log()
 
 
 if __name__ == '__main__':
@@ -185,4 +222,4 @@ if __name__ == '__main__':
         'rawdata',
         'data_out',
         verbose=True
-    ).start(32)
+    ).start(64)

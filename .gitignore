@@ -1,3 +1,7 @@
 *.tar
+*.raa
 *.idea/
 *.lightning_logs/
+*.DS_Store
+*.h264
+*.pyc
