@@ -1,12 +1,15 @@
+import pickle
 from io import BytesIO
-from typing import List, Optional, Any
+from typing import List, Optional, Any, Union, Tuple
 
 import av
+import numpy as np
 from av.video.frame import VideoFrame
 from cvproc import h264_to_ndarrays
 from numpy import ndarray
 from pydantic import ConfigDict, BaseModel
 from pydantic import field_serializer, model_validator
+from torch import Tensor, from_numpy
 
 av.logging.set_level(av.logging.ERROR)
 
@@ -22,6 +25,7 @@ class Video(BaseModel):
 
     @classmethod
     def from_frames(cls, frames: List[ndarray]) -> 'Video':
+        assert len(frames) > 0, 'Empty video'
         return cls.model_construct(
             frames=frames,
             frame_count=len(frames),
@@ -30,12 +34,22 @@ class Video(BaseModel):
         )
 
     @classmethod
-    def from_path(cls, source: str | BytesIO) -> 'Video':
+    def from_path(cls, source: Union[str, BytesIO]) -> 'Video':
         container = av.open(source)
-        return cls.from_frames([frame.to_rgb().to_ndarray() for frame in container.decode(video=0)])
+        frames = []
+        for frame in container.decode(video=0):
+            frame = frame.reformat(
+                width=224,
+                height=224,
+                format='yuv420p',
+                interpolation=av.video.reformatter.Interpolation.LANCZOS
+            )
+            frames.append(frame.to_ndarray(format='rgb24'))
+        return cls.from_frames(frames)
 
     @field_serializer('frames')
     def ser_model(self, frames: List[ndarray]) -> bytes:
+        print('Serializing video')
         buf = BytesIO()
         container = av.open(buf, mode='w', format='h264')
         stream = container.add_stream(
@@ -56,7 +70,7 @@ class Video(BaseModel):
         for packet in stream.encode():
             container.mux(packet)
         container.close()
-        return bytes(buf)
+        return bytes(buf.getvalue())
 
     @model_validator(mode='before')
     @classmethod
@@ -67,9 +81,19 @@ class Video(BaseModel):
             frames = h264_to_ndarrays(data['frames'])
         except Exception as e:
             raise ValueError('Failed to decode video') from e
-        assert len(frames) == data['frame_count'], 'Frame count mismatch'
+        assert len(frames) == data['frame_count'], 'Frame count mismatch: %d != %d' % (len(frames), data['frame_count'])
         data['frames'] = frames
         return data
+
+    def sample_frames(self, n: int):
+        if n > self.frame_count:
+            last = [self.frames[-1]] * (n - self.frame_count)
+            self.frames = self.frames + last
+            self.frame_count = len(self.frames)
+        indices = np.linspace(0, self.frame_count, n + 1, dtype=int)
+        indices = np.random.randint(indices[:-1], indices[1:], n)
+        self.frames = [self.frames[i] for i in indices]
+        self.frame_count = len(self.frames)
 
 
 class VideoSample(BaseModel):
@@ -77,6 +101,17 @@ class VideoSample(BaseModel):
         arbitrary_types_allowed=True,
     )
     key: str
-    cls: str
+    cls: Union[int, str]
     video: Video
     extra: Optional[dict] = None
+
+    @classmethod
+    def from_bytes(cls, data: bytes) -> 'VideoSample':
+        return VideoSample(**pickle.loads(data))
+
+    def sample_frames(self, n) -> 'VideoSample':
+        self.video.sample_frames(n)
+        return self
+
+    def to_tensors(self) -> Tuple[Tensor, Tensor]:
+        return from_numpy(np.array(int(self.cls))), from_numpy(np.asarray(self.video.frames).transpose(0, 3, 1, 2))

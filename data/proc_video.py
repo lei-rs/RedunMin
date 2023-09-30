@@ -1,16 +1,103 @@
 import gc
-import io
 import json
 import pathlib
+import pickle
+from io import BytesIO
 from multiprocessing import Pool, Queue
-from typing import Dict
+from typing import Dict, List, Union, Any, Optional
 
 import av
 import pandas as pd
-import pickle
-from pydantic import BaseModel
-from tqdm import tqdm
+from av.video.frame import VideoFrame
+from cvproc import h264_to_ndarrays
+from numpy import ndarray
+from pydantic import BaseModel, ConfigDict, field_serializer, model_validator
 from rand_archive import Writer
+from tqdm import tqdm
+
+
+av.logging.set_level(av.logging.ERROR)
+
+
+class Video(BaseModel):
+    model_config = ConfigDict(
+        arbitrary_types_allowed=True,
+    )
+    frames: List[ndarray]
+    frame_count: int
+    height: int
+    width: int
+
+    @classmethod
+    def from_frames(cls, frames: List[ndarray]) -> 'Video':
+        assert len(frames) > 0, 'Empty video'
+        return cls.model_construct(
+            frames=frames,
+            frame_count=len(frames),
+            height=frames[0].shape[0],
+            width=frames[0].shape[1],
+        )
+
+    @classmethod
+    def from_path(cls, source: Union[str, BytesIO]) -> 'Video':
+        container = av.open(source)
+        frames = []
+        for frame in container.decode(video=0):
+            frame = frame.reformat(
+                width=224,
+                height=224,
+                format='yuv420p',
+                interpolation=av.video.reformatter.Interpolation.LANCZOS
+            )
+            frames.append(frame.to_ndarray(format='rgb24'))
+        return cls.from_frames(frames)
+
+    @field_serializer('frames')
+    def ser_model(self, frames: List[ndarray]) -> bytes:
+        buf = BytesIO()
+        container = av.open(buf, mode='w', format='h264')
+        stream = container.add_stream(
+            'h264',
+            options={
+                'preset': 'ultrafast',
+                'tune': 'fastdecode',
+                'crf': '28',
+            }
+        )
+        stream.pix_fmt = 'yuv420p'
+        stream.width = frames[0].shape[1]
+        stream.height = frames[0].shape[0]
+        for frame in frames:
+            frame = VideoFrame.from_ndarray(frame, format='rgb24')
+            for packet in stream.encode(frame):
+                container.mux(packet)
+        for packet in stream.encode():
+            container.mux(packet)
+        container.close()
+        return bytes(buf.getvalue())
+
+    @model_validator(mode='before')
+    @classmethod
+    def validate_model(cls, data) -> Any:
+        assert isinstance(data, dict), 'Only dict is supported'
+        assert isinstance(data['frames'], bytes), 'Video is already decoded'
+        try:
+            frames = h264_to_ndarrays(data['frames'])
+        except Exception as e:
+            raise ValueError('Failed to decode video') from e
+        assert len(frames) == data['frame_count'], 'Frame count mismatch'
+        data['frames'] = frames
+        return data
+
+
+class VideoSample(BaseModel):
+    model_config = ConfigDict(
+        arbitrary_types_allowed=True,
+    )
+    key: str
+    cls: str
+    video: Video
+    extra: Optional[dict] = None
 
 
 class SampleMetadata(BaseModel):
@@ -51,7 +138,8 @@ class SSV2Metadata(VideoMetadata):
         train = json.load(open(str(self.md_path / f'{dataset}/train.json'), 'r'))
         val = json.load(open(str(self.md_path / f'{dataset}/val.json'), 'r'))
         test = json.load(open(str(self.md_path / f'{dataset}/test.json'), 'r'))
-        test_ans = pd.read_csv(str(self.md_path / f'{dataset}/test-answers.csv'), header=None, index_col=0, delimiter=';')
+        test_ans = pd.read_csv(str(self.md_path / f'{dataset}/test-answers.csv'), header=None, index_col=0,
+                               delimiter=';')
         self.int_labels = json.load(open(str(self.md_path / f'{dataset}/labels.json'), 'r'))
 
         for entry in train:
@@ -79,81 +167,25 @@ q = Queue(200)
 vmd = SSV2Metadata('ssv2')
 
 
-def _new_output(out_path, width, height):
-    output_container = av.open(out_path, 'wb', 'h264')
-    output_stream = output_container.add_stream(
-        'h264',
-        rate=30,
-        options={
-            'tune': 'fastdecode',
-            'crf': '28',
-        }
-    )
-    output_stream.pix_fmt = 'yuv420p'
-    output_stream.width = width
-    output_stream.height = height
-    return output_container, output_stream
-
-
-def _calc_new_dims(width, height, short_edge=224):
-    if width < height:
-        new_width = short_edge
-        new_height = int(height * short_edge / width)
-        if new_height % 2 != 0:
-            new_height += 1
-    else:
-        new_height = short_edge
-        new_width = int(width * short_edge / height)
-        if new_width % 2 != 0:
-            new_width += 1
-    return new_width, new_height
-
-
-def _resize_video(input_path: str):
-    num_frames = 0
-    input_container = av.open(input_path)
-    output = io.BytesIO()
-    output_container, output_stream = None, None
-
-    for i, frame in enumerate(input_container.decode(video=0)):
-        w, h = _calc_new_dims(frame.width, frame.height)
-        if output_container is None:
-            output_container, output_stream = _new_output(output, w, h)
-
-        frame = frame.reformat(
-            width=w,
-            height=h,
-            format='yuv420p',
-            interpolation=av.video.reformatter.Interpolation.LANCZOS
-        )
-
-        for packet in output_stream.encode(frame):
-            output_container.mux(packet)
-
-        num_frames += 1
-
-    for packet in output_stream.encode():
-        output_container.mux(packet)
-
-    input_container.close()
-    output_container.close()
-    return num_frames, output
-
-
 def _process_task(vid_path: pathlib.Path):
     vid_name = vid_path.stem
     try:
-        md = vmd.get_info(vid_name)
-        out = _resize_video(str(vid_path))
-        assert out[0] > 0, f'Empty video {vid_name}'
+        md = vmd.get_info(vid_name).model_dump()
+        vid = Video.from_path(str(vid_path))
+        sample = VideoSample(
+            key=md.pop('key'),
+            cls=md.pop('cls'),
+            video=vid,
+            extra=md
+        )
         gc.collect()
-        return q.put([out[1].getvalue(), md], block=True)
+        return q.put(sample.model_dump(mode='python'), block=True)
     except Exception as e:
-        return q.put([e, vid_name], block=True)
+        return q.put([e, vid_path], block=True)
 
 
 class VideoToWebdataset:
-    def __init__(self, input_path, output_path,  verbose=False):
+    def __init__(self, input_path, output_path, verbose=False):
         self.output_path = pathlib.Path(output_path)
         self.verbose = verbose
 
@@ -197,19 +229,14 @@ class VideoToWebdataset:
         for _ in pbar:
             out = q.get(block=True, timeout=100)
 
-            if out[1] is str:
-                e, vid_name = out
-                self.error_log.append(f'{vid_name} {str(e)}')
-                if self.verbose:
-                    print(f'Error processing {vid_name}: {str(e)}')
+            if isinstance(out, dict):
+                self._write_to_subset(out['key'], pickle.dumps(out), out['extra']['subset'])
 
             else:
-                raw, md = out
-                sample = {
-                    'md': dict(md),
-                    'video': raw,
-                }
-                self._write_to_subset(md.key, pickle.dumps(sample), md.subset)
+                e, vid_name = out
+                self.error_log.append(f'{str(vid_name)} {str(e)}')
+                if self.verbose:
+                    print(f'Error processing {str(vid_name)}: {str(e)}')
 
         p.close()
         p.join()
