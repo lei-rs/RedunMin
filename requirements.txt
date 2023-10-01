@@ -1,0 +1,8 @@
+rand-archive
+av
+numpy
+cvproc
+pydantic
+pypeln
+torchvision
+tqdm

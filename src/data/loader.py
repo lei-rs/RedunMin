@@ -52,7 +52,7 @@ class DataLoader:
         else:
             reader = reader.open_file(f'{self.config.data_loc}/{self.dataset}/{stage}.raa')
 
-        if self.config.shard and stage != 'test':
+        if self.config.shard and stage != 'tests':
             reader = reader.with_sharding(dist.get_rank(), dist.get_world_size())
 
         if hasattr(self.config, '_sim_shard'):
@@ -75,7 +75,7 @@ class DataLoader:
         )
 
         if self.transforms[stage] is not None:
-            loader = loader | pl.thread.map(self.transforms[stage], workers=4, maxsize=32)
+            loader = loader | pl.sync.map(lambda x: self.transforms[stage](x[-1]))
 
         if self.config.batch_size > 1:
             loader = (
@@ -100,7 +100,7 @@ class DataLoader:
         return self._get_loader('val')
 
     def test_loader(self) -> Iterable[Any]:
-        return self._get_loader('test')
+        return self._get_loader('tests')
 
 
 class SSV2(DataLoader):

@@ -34,7 +34,7 @@ pip-log.txt
 pip-delete-this-directory.txt
 pip-selfcheck.json
 
-# Unit test / coverage reports
+# Unit tests / coverage reports
 htmlcov/
 .tox/
 .coverage
@@ -75,5 +75,5 @@ docs/_build/
 .ipynb_checkpoints
 
 # Test Data
-test/data
+tests/data
 
