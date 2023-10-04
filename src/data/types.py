@@ -6,10 +6,9 @@ import av
 import numpy as np
 from av.video.frame import VideoFrame
 from cvproc import h264_to_ndarrays
-from numpy import ndarray
 from pydantic import ConfigDict, BaseModel
 from pydantic import field_serializer, model_validator
-from torch import Tensor, from_numpy
+import jax.numpy as jnp
 
 av.logging.set_level(av.logging.ERROR)
 
@@ -18,13 +17,13 @@ class Video(BaseModel):
     model_config = ConfigDict(
         arbitrary_types_allowed=True,
     )
-    frames: List[ndarray]
+    frames: List[np.ndarray]
     frame_count: int
     height: int
     width: int
 
     @classmethod
-    def from_frames(cls, frames: List[ndarray]) -> 'Video':
+    def from_frames(cls, frames: List[np.ndarray]) -> 'Video':
         assert len(frames) > 0, 'Empty video'
         return cls.model_construct(
             frames=frames,
@@ -48,7 +47,7 @@ class Video(BaseModel):
         return cls.from_frames(frames)
 
     @field_serializer('frames')
-    def ser_model(self, frames: List[ndarray]) -> bytes:
+    def ser_model(self, frames: List[np.ndarray]) -> bytes:
         print('Serializing video')
         buf = BytesIO()
         container = av.open(buf, mode='w', format='h264')
@@ -113,5 +112,9 @@ class VideoSample(BaseModel):
         self.video.sample_frames(n)
         return self
 
-    def to_tensors(self) -> Tuple[Tensor, Tensor]:
-        return from_numpy(np.array(int(self.cls))), from_numpy(np.asarray(self.video.frames).transpose(0, 3, 1, 2))
+    def to_arrays(self) -> Tuple[np.ndarray, np.ndarray]:
+        return np.array(int(self.cls)), np.asarray(self.video.frames).transpose(0, 3, 1, 2)
+
+    def to_tensors(self) -> Tuple[jnp.ndarray, jnp.ndarray]:
+        cls, vid = self.to_arrays()
+        return jnp.array(cls), jnp.array(vid)

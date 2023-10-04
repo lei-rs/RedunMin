@@ -6,3 +6,7 @@ pydantic
 pypeln
 torchvision
 tqdm
+jax
+numba
+transformers
+pandas

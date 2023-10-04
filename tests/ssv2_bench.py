@@ -1,6 +1,7 @@
 from src.data import DLConfig, SSV2
 from tqdm import tqdm
 
+
 config = DLConfig(
     data_loc='gs://redunmin',
     batch_size=32,

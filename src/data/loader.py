@@ -2,14 +2,9 @@ import pickle
 from typing import Any, Iterable, Callable, Optional, Dict, Tuple
 
 import pypeln as pl
-import torch
-import torch.distributed as dist
-import torchvision.transforms as T
 from rand_archive import Reader
-from torch.nn import Sequential
-from torch.utils.data import default_collate
-from torchvision.transforms import InterpolationMode
 
+from .transforms import Cutout
 from .types import VideoSample
 from .wrappers import Batcher
 
@@ -37,6 +32,7 @@ class DLConfig:
 
 class DataLoader:
     def __init__(self, dataset: str, config: DLConfig):
+        self.device = xm.xla_device()
         self.dataset = dataset
         self.config = config
 
@@ -70,17 +66,16 @@ class DataLoader:
 
         loader = (
             pl.sync.from_iterable(iter(loader))
-            | pl.thread.map(lambda x: VideoSample(**pickle.loads(x[1])), workers=6, maxsize=32)
-            | pl.sync.map(lambda x: x.sample_frames(self.config.n_frames).to_tensors())
+            | pl.thread.map(lambda x: VideoSample(**pickle.loads(x[1])), workers=8, maxsize=32)
+            | pl.sync.map(lambda x: x.sample_frames(self.config.n_frames).to_tensors(self.device))
         )
 
         if self.transforms[stage] is not None:
-            loader = loader | pl.sync.map(lambda x: self.transforms[stage](x[-1]))
+            loader = loader | pl.sync.map(lambda x: self.transforms[stage](x[-1]), workers=2, maxsize=32)
 
         if self.config.batch_size > 1:
             loader = (
                 Batcher(loader, self.config.batch_size)
-                | pl.thread.map(default_collate, workers=2, maxsize=32)
             )
 
         return loader
@@ -107,9 +102,6 @@ class SSV2(DataLoader):
     def __init__(self, config: DLConfig):
         super().__init__('ssv2', config)
 
-        transforms = {
-            'train': [
-                T.RandAugment(interpolation=InterpolationMode.BILINEAR)
-            ],
+        self.transforms = {
+            'train': Cutout(3, (8, 16)),
         }
-        self.transforms = {k: torch.jit.script(Sequential(*v)) for k, v in transforms.items()}

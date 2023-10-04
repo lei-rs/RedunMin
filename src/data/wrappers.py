@@ -1,7 +1,5 @@
 from typing import Iterable, Any
 
-from torch.utils.data import default_collate
-
 
 class Batcher:
     def __init__(self, inner: Iterable[Any], batch_size: int):
