@@ -10,14 +10,18 @@ from haliax.jax_utils import named_call, maybe_rng_split, shaped_rng_split
 from haliax.nn.scan import Stacked
 from transformers.models.vit import ViTConfig as HFViTConfig
 
-from serialize.safetensor import (
+from .levanter.flash_attention import flash_attention
+from .levanter.safetensor import (
     StateDict,
     STSerde,
+    apply_prefix,
+    unstack_state_dict,
+    stack_state_dict,
     unflatten_linear_layers,
     flatten_linear_layers,
-    apply_prefix, stack_state_dict, unstack_state_dict
 )
 
+TRAINING = False
 
 ACT2FN: Dict[str, Callable] = {
     "relu": hnn.relu,
@@ -29,9 +33,9 @@ ACT2FN: Dict[str, Callable] = {
 }
 
 
-@dataclass(frozen=True)
+@dataclass
 class ViTConfig:
-    len: int = 8 * (224 ** 2 // 16 ** 2)
+    n_patches: int = (224 ** 2 // 16 ** 2)
     hidden_size: int = 768
     num_hidden_layers: int = 12
     num_attention_heads: int = 12
@@ -42,8 +46,10 @@ class ViTConfig:
     layer_norm_eps: float = 1e-12
     patch_size: int = 16
     qkv_bias: bool = True
+    dropout = 0.1
+    flash_attention: bool = False
 
-    Pos = property(lambda self: Axis(name="position", size=self.len))
+    Pos = property(lambda self: Axis(name="position", size=self.n_patches))
     KeyPos = property(lambda self: self.Pos.alias("key_position"))
     Embed = property(lambda self: Axis(name="embed", size=self.hidden_size))
     Layers = property(lambda self: Axis(name="layers", size=self.num_hidden_layers))
@@ -52,9 +58,9 @@ class ViTConfig:
     HeadSize = property(lambda self: Axis(name="head_size", size=self.hidden_size // self.num_attention_heads))
 
     @classmethod
-    def from_hf_config(cls, hf_config: HFViTConfig) -> 'ViTConfig':
+    def from_hf_config(cls, hf_config: HFViTConfig, flash_attention: bool = False) -> 'ViTConfig':
         return ViTConfig(
-            len=(hf_config.image_size ** 2 // hf_config.patch_size ** 2),
+            n_patches=(hf_config.image_size ** 2 // hf_config.patch_size ** 2),
             hidden_size=hf_config.hidden_size,
             num_hidden_layers=hf_config.num_hidden_layers,
             num_attention_heads=hf_config.num_attention_heads,
@@ -65,13 +71,17 @@ class ViTConfig:
             layer_norm_eps=hf_config.layer_norm_eps,
             patch_size=hf_config.patch_size,
             qkv_bias=hf_config.qkv_bias,
+            flash_attention=flash_attention,
         )
 
 
 class ViTMLP(eqx.Module, STSerde):
-    to_embed: hnn.Linear
-    from_embed: hnn.Linear
+    to_hidden: hnn.Linear
+    from_hidden: hnn.Linear
     act: Callable = eqx.static_field()
+    dropout: float = eqx.static_field()
+
+    Embed: Axis = eqx.static_field()
 
     @staticmethod
     def init(
@@ -81,32 +91,46 @@ class ViTMLP(eqx.Module, STSerde):
             Union[str, Callable],
             *,
             key,
-            use_bias: bool = False
+            use_bias: bool = False,
+            dropout: float = 0.1,
     ) -> 'ViTMLP':
         k_to_embed, k_from_embed = jrand.split(key)
-        to_embed = hnn.Linear.init(Out=Mlp, In=Embed, key=k_to_embed, use_bias=use_bias)
-        from_embed = hnn.Linear.init(Out=Embed, In=Mlp, key=k_from_embed, use_bias=use_bias)
+
+        to_hidden = hnn.Linear.init(Out=Mlp, In=Embed, key=k_to_embed, use_bias=use_bias, out_first=True)
+        from_hidden = hnn.Linear.init(Out=Embed, In=Mlp, key=k_from_embed, use_bias=use_bias, out_first=True)
+
         if isinstance(activation_fn, str):
             activation_fn = ACT2FN[activation_fn]
         act = activation_fn
+
         return ViTMLP(
-            to_embed=to_embed,
-            from_embed=from_embed,
+            to_hidden=to_hidden,
+            from_hidden=from_hidden,
             act=act,
+            dropout=dropout,
+            Embed=Embed,
         )
 
     @named_call
     def __call__(self, x: NamedArray, *, key=None) -> NamedArray:
-        k_to_embed, k_from_embed = jrand.split(key)
-        hidden = self.to_embed(x, key=k_to_embed)
+        k_dropout = maybe_rng_split(key, 1)
+        hidden = self.to_hidden(x)
         hidden = self.act(hidden)
-        hidden = self.from_embed(hidden, key=k_from_embed)
+        if self.dropout > 0:
+            hidden = hnn.dropout(
+                hidden,
+                self.dropout,
+                broadcast_axes=self.Embed,
+                key=k_dropout,
+                inference=not TRAINING,
+            )
+        hidden = self.from_hidden(hidden)
         return hidden
 
     def _state_dict_key_map(self) -> Optional[Dict[str, Optional[str]]]:
         return {
-            'to_embed': 'intermediate.dense',
-            'from_embed': 'output.dense',
+            'to_hidden': 'intermediate.dense',
+            'from_hidden': 'output.dense',
         }
 
 
@@ -116,6 +140,8 @@ class ViTAttention(eqx.Module, STSerde):
     k_proj: hnn.Linear
     v_proj: hnn.Linear
     out_proj: hnn.Linear
+
+    flash_attention: bool = eqx.static_field()
 
     @staticmethod
     def init(config: ViTConfig, *, key) -> 'ViTAttention':
@@ -132,20 +158,44 @@ class ViTAttention(eqx.Module, STSerde):
             k_proj=k_proj,
             v_proj=v_proj,
             out_proj=out_proj,
+            flash_attention=config.flash_attention,
         )
 
     @named_call
     def __call__(self, x: NamedArray, *, key=None) -> NamedArray:
-        key_q, key_k, key_v, key_o = maybe_rng_split(key, 4)
-
-        q = self.q_proj(x, key=key_q).rearrange((..., "heads", "position", "head_size"))
-        k = self.k_proj(x, key=key_k).rearrange((..., "heads", "position", "head_size"))
-        v = self.v_proj(x, key=key_v).rearrange((..., "heads", "position", "head_size"))
-
         c = self.config
-        attn_output = hnn.attention.dot_product_attention(c.Pos, c.KeyPos, c.HeadSize, q, k, v,)
+
+        k_attn = maybe_rng_split(key, 1)
+        q = self.q_proj(x).rearrange((..., "heads", "position", "head_size"))
+        k = self.k_proj(x).rearrange((..., "heads", "position", "head_size"))
+        v = self.v_proj(x).rearrange((..., "heads", "position", "head_size"))
+        k = k.rename({"position": "key_position"})
+        v = v.rename({"position": "key_position"})
+
+        if self.flash_attention:
+            attn_output = flash_attention(
+                c.Pos,
+                c.KeyPos,
+                c.HeadSize,
+                q,
+                k,
+                v,
+                dropout=c.dropout,
+                inference=False,
+                key=k_attn,
+            )
+        else:
+            attn_output = hnn.attention.dot_product_attention(
+                c.Pos,
+                c.KeyPos,
+                c.HeadSize,
+                q,
+                k,
+                v,
+            )
+
         attn_output = attn_output.rearrange((..., "position", "heads", "head_size"))
-        attn_output = self.out_proj(attn_output, key=key_o)
+        attn_output = self.out_proj(attn_output)
         return attn_output
 
     def _state_dict_key_map(self) -> Optional[Dict[str, Optional[str]]]:
@@ -240,7 +290,7 @@ class VitEncoderLayer(eqx.Module, STSerde):
     def init(config: ViTConfig, *, key) -> 'VitEncoderLayer':
         k_attn, key_mlp = jrand.split(key, 2)
         attention = ViTAttention.init(config, key=k_attn)
-        mlp = ViTMLP.init(config.Mlp, config.Embed, config.hidden_act, key=key_mlp)
+        mlp = ViTMLP.init(config.Embed, config.Mlp, config.hidden_act, key=key_mlp)
         ln1 = hnn.LayerNorm.init(config.Embed, eps=config.layer_norm_eps)
         ln2 = hnn.LayerNorm.init(config.Embed, eps=config.layer_norm_eps)
         return VitEncoderLayer(
@@ -252,8 +302,8 @@ class VitEncoderLayer(eqx.Module, STSerde):
         )
 
     @named_call
-    def __call__(self, x: NamedArray, *, key=None) -> NamedArray:
-        k_attn, k_mlp = maybe_rng_split(key, 2)
+    def __call__(self, x: NamedArray, *, key) -> NamedArray:
+        k_attn, k_mlp = jrand.split(key, 2)
         x = self.ln1(x)
         attn_output = self.attention(x, key=key)
         x = x + attn_output
@@ -287,9 +337,9 @@ class ViTEncoder(eqx.Module, STSerde):
         )
 
     @named_call
-    def __call__(self, x: NamedArray, *, key=None) -> NamedArray:
-        keys = maybe_rng_split(key, self.config.num_hidden_layers) if key is not None else None
-        x = self.layers.fold(x, keys=keys)
+    def __call__(self, x: NamedArray, *, key) -> NamedArray:
+        keys = jrand.split(key, self.config.num_hidden_layers)
+        x = self.layers.fold(x, key=keys)
         return x
 
     def _state_dict_key_map(self) -> Optional[Dict[str, Optional[str]]]:
@@ -310,21 +360,3 @@ class ViTEncoder(eqx.Module, STSerde):
         state_dict.update(stacked_dict)
 
         return state_dict
-
-
-if __name__ == '__main__':
-    from transformers import ViTModel
-    import jax.numpy as jnp
-
-    hf_model = ViTModel.from_pretrained('google/vit-base-patch16-224-in21k')
-    config = ViTConfig.from_hf_config(hf_model.config)
-    sd = hf_model.state_dict()
-    del hf_model
-    for k, v in sd.items():
-        sd[k] = jnp.array(v.numpy())
-
-    key = jrand.PRNGKey(0)
-    ViTEncoder.init(config, key=key).from_state_dict(
-        state_dict=sd,
-        prefix='encoder',
-    )
