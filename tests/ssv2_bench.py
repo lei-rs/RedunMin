@@ -1,13 +1,15 @@
-from src.data import DLConfig, SSV2
+import jax
 from tqdm import tqdm
 
+from src.data import DLConfig, SSV2
+from src.data.loader import DataLoader
 
 config = DLConfig(
-    data_loc='gs://redunmin',
-    batch_size=32,
-    _sim_shard=(0, 8)
+    data_loc='gs://redunmin-us',
+    batch_size=1,
 )
 loader = SSV2(config)
 
-for i in tqdm(loader.train_loader()):
-    pass
+for i, x in enumerate(tqdm(loader.train_loader())):
+    if i > 10_000:
+        break

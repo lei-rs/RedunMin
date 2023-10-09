@@ -3,13 +3,12 @@ from io import BytesIO
 from typing import List, Optional, Any, Union, Tuple
 
 import av
+import jax.numpy as jnp
 import numpy as np
 from av.video.frame import VideoFrame
 from cvproc import h264_to_ndarrays
 from pydantic import ConfigDict, BaseModel
 from pydantic import field_serializer, model_validator
-import jax.numpy as jnp
-
 
 av.logging.set_level(av.logging.ERROR)
 
@@ -118,4 +117,6 @@ class VideoSample(BaseModel):
 
     def to_tensors(self) -> Tuple[jnp.ndarray, jnp.ndarray]:
         cls, vid = self.to_arrays()
-        return jnp.array(cls), jnp.array(vid)
+        cls = jnp.asarray(cls)
+        vid = jnp.asarray(vid)
+        return cls, vid

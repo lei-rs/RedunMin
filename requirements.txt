@@ -6,7 +6,7 @@ pydantic
 pypeln
 tqdm
 jax
-pandas~=2.1.1
+pandas
 equinox
 haliax
 jaxtyping

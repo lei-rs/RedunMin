@@ -2,6 +2,7 @@ import pickle
 from dataclasses import dataclass
 from typing import Any, Iterable, Callable, Optional, Dict
 
+import jax
 import pypeln as pl
 from rand_archive import Reader
 
@@ -29,7 +30,7 @@ class DataLoader:
         self.epoch = 0
 
     def _build_reader(self, stage) -> Iterable[Any]:
-        reader = Reader().by_count(32)
+        reader = Reader().by_count(64)
 
         if self.config.data_loc.startswith('gs://'):
             reader = reader.open_gcs(f'{self.config.data_loc}/{self.dataset}/{stage}.raa').with_buffering(32)
@@ -48,12 +49,12 @@ class DataLoader:
 
         loader = (
             pl.sync.from_iterable(iter(loader))
-            | pl.thread.map(lambda x: VideoSample(**pickle.loads(x[1])), workers=8, maxsize=32)
-            | pl.sync.map(lambda x: x.sample_frames(self.config.n_frames).to_tensors())
+            | pl.thread.map(lambda x: VideoSample(**pickle.loads(x[1])), workers=12, maxsize=32)
+            | pl.thread.map(lambda x: x.sample_frames(self.config.n_frames).to_tensors(), workers=4, maxsize=16)
         )
 
         if self.transforms[stage] is not None:
-            loader = loader | pl.sync.map(lambda x: self.transforms[stage](x[-1]), workers=2, maxsize=32)
+            loader = loader | pl.sync.map(lambda x: self.transforms[stage](x), workers=2, maxsize=32)
 
         if self.config.batch_size > 1:
             loader = (
@@ -82,13 +83,13 @@ class DataLoader:
 class SSV2(DataLoader):
     def __init__(self, config: DLConfig):
         super().__init__('ssv2', config)
-
+        key = jax.random.key(config.base_seed)
         self.transforms = {
             'train': T.TrivialAugment([
-                T.Cutout(8, (8, 32)),
                 T.FlipHorizontal(),
                 T.Shear('x', (0, 1)),
                 T.Shear('y', (0, 1)),
                 T.Rotate((0, 360)),
-            ]),
+                T.Invert(),
+            ], key=key, debug=True),
         }

@@ -1,6 +1,8 @@
 from functools import partial
 from typing import Tuple, Union, List, Literal
 
+import numpy as np
+import numba
 from jax.numpy import ndarray
 import jax
 import jax.numpy as jnp
@@ -8,6 +10,10 @@ from jax.scipy.ndimage import map_coordinates
 
 
 class Augment:
+    @staticmethod
+    def _f():
+        raise NotImplementedError
+
     def _call(self, video: ndarray, *, key=None) -> ndarray:
         raise NotImplementedError
 
@@ -62,13 +68,14 @@ class Cutout(Augment):
         return video
 
     def _call(self, video: ndarray, *, key) -> ndarray:
-        return self._cutout(
+        video = np.asarray(video)
+        video = self._cutout(
             video,
             self.num_crops,
             self.crop_size_range,
-            key=key,
             fill=self.fill
         )
+        return jnp.asarray(video)
 
     def update_strength(self, strength: float):
         self.num_crops = int(self.max_num_crops * strength)
@@ -76,11 +83,12 @@ class Cutout(Augment):
 
 class FlipHorizontal(Augment):
     @staticmethod
-    def _flip(video: ndarray):
+    @jax.jit
+    def _t(video: ndarray):
         return video[:, :, :, ::-1]
 
     def _call(self, video: ndarray, *, key) -> ndarray:
-        return self._flip(video)
+        return self._t(video)
 
     def update_strength(self, strength: float):
         return
@@ -92,9 +100,10 @@ class Shear(Augment):
         self.factor_range = factor_range
         self.factor = sum(factor_range) / 2
 
+        self._t = jax.jit(partial(self._t, axis=axis))
+
     @staticmethod
-    @jax.jit
-    def _shear(video: ndarray, axis: Literal['x', 'y'], factor: float):
+    def _t(video: ndarray, axis: Literal['x', 'y'], factor: float):
         T, C, H, W = video.shape
         y_coords, x_coords = jnp.mgrid[:H, :W]
         if axis == 'x':
@@ -104,12 +113,12 @@ class Shear(Augment):
         else:
             raise ValueError(f'Axis must be one of x or y, got {axis}')
         video_reshaped = video.reshape(T * C, H, W)
-        func = partial(map_coordinates, coordinates=[x_coords, y_coords], order=1)
+        func = partial(map_coordinates, coordinates=[x_coords, y_coords], order=0)
         sheared = jax.vmap(func)(video_reshaped)
         return sheared.reshape(T, C, H, W)
 
     def _call(self, video: ndarray, *, key) -> ndarray:
-        return self._shear(video, self.axis, self.factor)
+        return self._t(video, factor=self.factor)
 
     def update_strength(self, strength: float):
         self.factor = (self.factor_range[1] - self.factor_range[0]) * strength
@@ -122,7 +131,7 @@ class Rotate(Augment):
 
     @staticmethod
     @jax.jit
-    def _rotate(video: ndarray, angle: float):
+    def _t(video: ndarray, angle: float):
         T, C, H, W = video.shape
         y_coords, x_coords = jnp.mgrid[:H, :W]
         angle = jnp.deg2rad(angle)
@@ -133,23 +142,45 @@ class Rotate(Augment):
         x_coords = x_coords + W / 2
         y_coords = y_coords + H / 2
         video_reshaped = video.reshape(T * C, H, W)
-        func = partial(map_coordinates, coordinates=[x_coords, y_coords], order=1)
+        func = partial(map_coordinates, coordinates=[x_coords, y_coords], order=0)
         rotated = jax.vmap(func)(video_reshaped)
         return rotated.reshape(T, C, H, W)
 
     def _call(self, video: ndarray, *, key) -> ndarray:
-        return self._rotate(video, self.angle)
+        return self._t(video, self.angle)
 
     def update_strength(self, strength: float):
         self.angle = (self.angle_range[1] - self.angle_range[0]) * strength
 
 
-class TrivialAugment:
-    def __init__(self, augments: List[Augment]):
-        self.augments = augments
+class Invert(Augment):
+    @staticmethod
+    @jax.jit
+    def _t(video: ndarray):
+        return 255 - video
 
-    def __call__(self, video: ndarray, *, key=None) -> ndarray:
-        aug = jax.random.choice(key, self.augments)
-        strength = jax.random.uniform(key, minval=0, maxval=1)
+    def _call(self, video: ndarray, *, key) -> ndarray:
+        return self._t(video)
+
+    def update_strength(self, strength: float):
+        return
+
+
+class TrivialAugment:
+    def __init__(self, augments: List[Augment], bins: int = 10, *, key, debug=False):
+        self.augments = augments
+        self.strengths = jnp.linspace(0, 1, bins)
+        self.key = key
+        self.debug = debug
+
+    def __call__(self, video: ndarray) -> ndarray:
+        self.key, key_aug, key_strength = jax.random.split(self.key, 3)
+        aug = jax.random.choice(key_aug, len(self.augments))
+        aug = self.augments[aug]
+        strength = jax.random.choice(key_strength, self.strengths)
         aug.update_strength(strength)
-        return aug(video, key=key)
+        if self.debug:
+            print(f'Augment: {aug.__class__.__name__}, Strength: {strength}')
+            if hasattr(aug, '_f'):
+                print(f'Cache Size: {aug._f._cache_size()}')
+        return aug(video, key=key_aug)
