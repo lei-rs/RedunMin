@@ -33,6 +33,11 @@ ACT2FN: Dict[str, Callable] = {
 }
 
 
+def update_train_flag(mode: bool):
+    global TRAINING
+    TRAINING = mode
+
+
 @dataclass
 class ViTConfig:
     n_patches: int = (224 ** 2 // 16 ** 2)

@@ -15,3 +15,8 @@ class Batcher:
             if self.buffer_idx == self.batch_size:
                 yield self.buffer
                 self.buffer_idx = 0
+        self.reset()
+
+    def reset(self):
+        self.buffer = [0] * self.batch_size
+        self.buffer_idx = 0

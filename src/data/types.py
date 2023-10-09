@@ -10,6 +10,7 @@ from pydantic import ConfigDict, BaseModel
 from pydantic import field_serializer, model_validator
 import jax.numpy as jnp
 
+
 av.logging.set_level(av.logging.ERROR)
 
 

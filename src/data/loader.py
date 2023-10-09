@@ -1,38 +1,26 @@
 import pickle
-from typing import Any, Iterable, Callable, Optional, Dict, Tuple
+from dataclasses import dataclass
+from typing import Any, Iterable, Callable, Optional, Dict
 
 import pypeln as pl
 from rand_archive import Reader
 
-from .transforms import Cutout
+import src.data.transforms as T
 from .types import VideoSample
 from .wrappers import Batcher
 
 
+@dataclass(init=True, repr=True, frozen=True)
 class DLConfig:
-    def __init__(
-            self,
-            data_loc: str,
-            batch_size: int = 1,
-            shard: bool = False,
-            shuffle: bool = False,
-            n_frames: int = 32,
-            base_seed: int = 42,
-            **kwargs
-    ):
-        self.data_loc = data_loc
-        self.batch_size = batch_size
-        self.shard = shard
-        self.shuffle = shuffle
-        self.n_frames = n_frames
-        self.base_seed = base_seed
-        for k, v in kwargs.items():
-            setattr(self, k, v)
+    data_loc: str
+    batch_size: int = 1
+    shuffle: bool = False
+    n_frames: int = 32
+    base_seed: int = 42
 
 
 class DataLoader:
     def __init__(self, dataset: str, config: DLConfig):
-        self.device = xm.xla_device()
         self.dataset = dataset
         self.config = config
 
@@ -48,12 +36,6 @@ class DataLoader:
         else:
             reader = reader.open_file(f'{self.config.data_loc}/{self.dataset}/{stage}.raa')
 
-        if self.config.shard and stage != 'tests':
-            reader = reader.with_sharding(dist.get_rank(), dist.get_world_size())
-
-        if hasattr(self.config, '_sim_shard'):
-            reader = reader.with_sharding(*self.config._sim_shard)
-
         return reader
 
     def _update_transforms(self):
@@ -67,7 +49,7 @@ class DataLoader:
         loader = (
             pl.sync.from_iterable(iter(loader))
             | pl.thread.map(lambda x: VideoSample(**pickle.loads(x[1])), workers=8, maxsize=32)
-            | pl.sync.map(lambda x: x.sample_frames(self.config.n_frames).to_tensors(self.device))
+            | pl.sync.map(lambda x: x.sample_frames(self.config.n_frames).to_tensors())
         )
 
         if self.transforms[stage] is not None:
@@ -81,7 +63,6 @@ class DataLoader:
         return loader
 
     def _epoch_seed(self) -> int:
-        # this seed is rank equivariant
         return self.config.base_seed + self.epoch
 
     def step(self):
@@ -103,5 +84,11 @@ class SSV2(DataLoader):
         super().__init__('ssv2', config)
 
         self.transforms = {
-            'train': Cutout(3, (8, 16)),
+            'train': T.TrivialAugment([
+                T.Cutout(8, (8, 32)),
+                T.FlipHorizontal(),
+                T.Shear('x', (0, 1)),
+                T.Shear('y', (0, 1)),
+                T.Rotate((0, 360)),
+            ]),
         }

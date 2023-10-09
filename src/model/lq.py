@@ -21,7 +21,7 @@ class LQViTConfig:
     n_classes: int
     vit_config: Optional[ViTConfig] = None
 
-    TIn = property(lambda self: Axis(name='time_og', size=self.t_in))
+    TIn = property(lambda self: Axis(name='time_in', size=self.t_in))
     TOut = property(lambda self: Axis(name='time', size=self.t_out))
     Spatial = property(lambda self: Axis(name='spatial', size=self.vit_config.n_patches))
     Cls = property(lambda self: Axis(name='cls', size=self.n_classes))
@@ -58,20 +58,20 @@ class LQAttention(eqx.Module):
         )
 
     @named_call
-    def __call__(self, x: NamedArray, q: NamedArray, *, key=None) -> NamedArray:
+    def __call__(self, x: NamedArray, *, key=None) -> NamedArray:
         c = self.config
 
-        x = x.rearrange((..., "spatial", "time_og", "embed"))
-        k = self.k_proj(x).rearrange((..., "heads", "time_og", "head_size"))
-        v = self.v_proj(x).rearrange((..., "heads", "time_og", "head_size"))
+        x = x.rearrange((..., "spatial", "time_in", "embed"))
+        k = self.k_proj(x).rearrange((..., "heads", "time_in", "head_size"))
+        v = self.v_proj(x).rearrange((..., "heads", "time_in", "head_size"))
 
         attn_output = hnn.attention.dot_product_attention(
-            c.TIn,
-            c.TOut,
-            c.vit_config.HeadSize,
-            self.queries,
-            k,
-            v,
+            QPos=c.TOut,
+            KPos=c.TIn,
+            KeySize=c.vit_config.HeadSize,
+            query=self.queries,
+            key=k,
+            value=v,
         )
 
         attn_output = attn_output.rearrange((..., "time", "heads", "head_size"))
