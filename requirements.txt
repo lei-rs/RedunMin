@@ -13,3 +13,6 @@ jaxtyping
 safetensors
 transformers
 google-cloud-storage
+pytest
+pytest-benchmark
+jax_dataclasses

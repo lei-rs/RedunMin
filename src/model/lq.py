@@ -1,10 +1,12 @@
-from dataclasses import dataclass
 from typing import Optional, Dict
 
 import equinox as eqx
 import haliax as hax
 import haliax.nn as hnn
+import jax
+import jax.numpy as jnp
 import jax.random as jrand
+import jax_dataclasses as jdc
 from google.cloud import storage
 from haliax import NamedArray, Axis
 from haliax.jax_utils import named_call, maybe_rng_split
@@ -12,25 +14,27 @@ from safetensors.numpy import load
 from transformers import ViTConfig as HFViTConfig
 
 from .levanter.safetensor import STSerde
-from .vit_encoder import ViTConfig, ViTEncoder
+from .vit import ViTConfig, ViTEncoder
 
 
-@dataclass(init=True, repr=True)
+@jdc.pytree_dataclass(init=True, repr=True)
 class LQViTConfig:
     t_in: int
     t_out: int
     n_classes: int
-    vit_config: Optional[ViTConfig] = None
+    vit_config: ViTConfig = ViTConfig()
 
     TIn = property(lambda self: Axis(name='time_in', size=self.t_in))
     TOut = property(lambda self: Axis(name='time', size=self.t_out))
     Spatial = property(lambda self: Axis(name='spatial', size=self.vit_config.n_patches))
     Cls = property(lambda self: Axis(name='cls', size=self.n_classes))
 
-    def add_vit_cfg(self, cfg: ViTConfig):
-        cfg.n_patches *= self.t_out
-        self.vit_config = cfg
-        return self
+    def wrap_vit_cfg(self, cfg: ViTConfig):
+        with jdc.copy_and_mutate(cfg) as cfg:
+            cfg.n_patches *= self.t_out
+        with jdc.copy_and_mutate(self) as slf:
+            slf.vit_config = cfg
+            return slf
 
 
 class LQAttention(eqx.Module):
@@ -122,9 +126,9 @@ class LQViT(eqx.Module, STSerde):
         )
 
     @staticmethod
-    def from_pretrained(name: str, path: str, config: LQViTConfig, *, key, flash_attn=False) -> 'LQViT':
-        vit_cfg = ViTConfig.from_hf_config(HFViTConfig.from_pretrained(name), flash_attn)
-        config = config.add_vit_cfg(vit_cfg)
+    def from_pretrained(name: str, path: str, config: LQViTConfig, *, key, dtype=None) -> 'LQViT':
+        vit_cfg = ViTConfig.from_hf_config(HFViTConfig.from_pretrained(name))
+        config = config.wrap_vit_cfg(vit_cfg)
         slf = LQViT.init(config, key=key)
 
         if path.startswith('gs://'):
@@ -132,9 +136,13 @@ class LQViT(eqx.Module, STSerde):
             bucket = client.get_bucket(path.split('/')[2])
             blob = bucket.blob('/'.join(path.split('/')[3:]))
             sd = load(blob.download_as_bytes())
+        else:
+            sd = load(path)
 
         slf.vit_encoder.from_state_dict(sd, prefix='encoder')
-        return slf
+        if dtype is not None:
+            slf = slf.astype(dtype)
+        return
 
     @named_call
     def __call__(self, x: NamedArray, *, key=None) -> NamedArray:
@@ -151,3 +159,7 @@ class LQViT(eqx.Module, STSerde):
             'vit_encoder': 'encoder',
             'cls_head': 'cls_head',
         }
+
+    def astype(self, dtype: jnp.dtype) -> 'LQViT':
+        cast_fn = lambda x: x.astype(dtype) if isinstance(x, jnp.ndarray) else x
+        return jax.tree_map(cast_fn, self)

@@ -1,16 +1,15 @@
-from dataclasses import dataclass
 from functools import partial
 from typing import Callable, Union, Optional, Dict
 
 import equinox as eqx
 import haliax.nn as hnn
 import jax.random as jrand
+import jax_dataclasses as jdc
 from haliax import Axis, NamedArray
 from haliax.jax_utils import named_call, maybe_rng_split, shaped_rng_split
 from haliax.nn.scan import Stacked
 from transformers.models.vit import ViTConfig as HFViTConfig
 
-from .levanter.flash_attention import flash_attention
 from .levanter.safetensor import (
     StateDict,
     STSerde,
@@ -21,15 +20,13 @@ from .levanter.safetensor import (
     flatten_linear_layers,
 )
 
-TRAINING = False
+TRAINING = True
 
 ACT2FN: Dict[str, Callable] = {
     "relu": hnn.relu,
     "silu": hnn.silu,
     "swish": hnn.swish,
-    "gelu": partial(hnn.gelu, approximate=False),
-    "gelu_new": partial(hnn.gelu, approximate=True),
-    "quick_gelu": hnn.quick_gelu,
+    "gelu": hnn.quick_gelu,
 }
 
 
@@ -38,21 +35,20 @@ def update_train_flag(mode: bool):
     TRAINING = mode
 
 
-@dataclass
+@jdc.pytree_dataclass(init=True, repr=True)
 class ViTConfig:
     n_patches: int = (224 ** 2 // 16 ** 2)
     hidden_size: int = 768
     num_hidden_layers: int = 12
     num_attention_heads: int = 12
     intermediate_size: int = 3072
-    hidden_act: str = 'gelu'
+    hidden_act: Callable = hnn.quick_gelu
     hidden_dropout_prob: float = 0.1
     initializer_range: float = 0.02
     layer_norm_eps: float = 1e-12
     patch_size: int = 16
     qkv_bias: bool = True
     dropout = 0.1
-    flash_attention: bool = False
 
     Pos = property(lambda self: Axis(name="position", size=self.n_patches))
     KeyPos = property(lambda self: self.Pos.alias("key_position"))
@@ -63,28 +59,27 @@ class ViTConfig:
     HeadSize = property(lambda self: Axis(name="head_size", size=self.hidden_size // self.num_attention_heads))
 
     @classmethod
-    def from_hf_config(cls, hf_config: HFViTConfig, flash_attention: bool = False) -> 'ViTConfig':
+    def from_hf_config(cls, hf_config: HFViTConfig) -> 'ViTConfig':
         return ViTConfig(
             n_patches=(hf_config.image_size ** 2 // hf_config.patch_size ** 2),
             hidden_size=hf_config.hidden_size,
             num_hidden_layers=hf_config.num_hidden_layers,
             num_attention_heads=hf_config.num_attention_heads,
             intermediate_size=hf_config.intermediate_size,
-            hidden_act=hf_config.hidden_act,
+            hidden_act=ACT2FN[hf_config.hidden_act],
             hidden_dropout_prob=hf_config.hidden_dropout_prob,
             initializer_range=hf_config.initializer_range,
             layer_norm_eps=hf_config.layer_norm_eps,
             patch_size=hf_config.patch_size,
             qkv_bias=hf_config.qkv_bias,
-            flash_attention=flash_attention,
         )
 
 
 class ViTMLP(eqx.Module, STSerde):
     to_hidden: hnn.Linear
     from_hidden: hnn.Linear
+    dropout: hnn.Dropout
     act: Callable = eqx.static_field()
-    dropout: float = eqx.static_field()
 
     Embed: Axis = eqx.static_field()
 
@@ -92,8 +87,7 @@ class ViTMLP(eqx.Module, STSerde):
     def init(
             Embed: Axis,
             Mlp: Axis,
-            activation_fn:
-            Union[str, Callable],
+            act: Callable,
             *,
             key,
             use_bias: bool = False,
@@ -103,34 +97,24 @@ class ViTMLP(eqx.Module, STSerde):
 
         to_hidden = hnn.Linear.init(Out=Mlp, In=Embed, key=k_to_embed, use_bias=use_bias, out_first=True)
         from_hidden = hnn.Linear.init(Out=Embed, In=Mlp, key=k_from_embed, use_bias=use_bias, out_first=True)
-
-        if isinstance(activation_fn, str):
-            activation_fn = ACT2FN[activation_fn]
-        act = activation_fn
+        dropout = hnn.Dropout(dropout, broadcast_axes=Mlp)
 
         return ViTMLP(
             to_hidden=to_hidden,
             from_hidden=from_hidden,
-            act=act,
             dropout=dropout,
+            act=act,
             Embed=Embed,
         )
 
     @named_call
     def __call__(self, x: NamedArray, *, key=None) -> NamedArray:
         k_dropout = maybe_rng_split(key, 1)
-        hidden = self.to_hidden(x)
-        hidden = self.act(hidden)
-        if self.dropout > 0:
-            hidden = hnn.dropout(
-                hidden,
-                self.dropout,
-                broadcast_axes=self.Embed,
-                key=k_dropout,
-                inference=not TRAINING,
-            )
-        hidden = self.from_hidden(hidden)
-        return hidden
+        x = self.to_hidden(x)
+        x = self.act(x)
+        x = self.dropout(x, key=k_dropout, inference=not TRAINING)
+        x = self.from_hidden(x)
+        return x
 
     def _state_dict_key_map(self) -> Optional[Dict[str, Optional[str]]]:
         return {
@@ -145,8 +129,6 @@ class ViTAttention(eqx.Module, STSerde):
     k_proj: hnn.Linear
     v_proj: hnn.Linear
     out_proj: hnn.Linear
-
-    flash_attention: bool = eqx.static_field()
 
     @staticmethod
     def init(config: ViTConfig, *, key) -> 'ViTAttention':
@@ -163,42 +145,24 @@ class ViTAttention(eqx.Module, STSerde):
             k_proj=k_proj,
             v_proj=v_proj,
             out_proj=out_proj,
-            flash_attention=config.flash_attention,
         )
 
     @named_call
     def __call__(self, x: NamedArray, *, key=None) -> NamedArray:
         c = self.config
-
-        k_attn = maybe_rng_split(key, 1)
         q = self.q_proj(x).rearrange((..., "heads", "position", "head_size"))
         k = self.k_proj(x).rearrange((..., "heads", "position", "head_size"))
         v = self.v_proj(x).rearrange((..., "heads", "position", "head_size"))
         k = k.rename({"position": "key_position"})
         v = v.rename({"position": "key_position"})
-
-        if self.flash_attention:
-            attn_output = flash_attention(
-                c.Pos,
-                c.KeyPos,
-                c.HeadSize,
-                q,
-                k,
-                v,
-                dropout=c.dropout,
-                inference=False,
-                key=k_attn,
-            )
-        else:
-            attn_output = hnn.attention.dot_product_attention(
-                c.Pos,
-                c.KeyPos,
-                c.HeadSize,
-                q,
-                k,
-                v,
-            )
-
+        attn_output = hnn.attention.dot_product_attention(
+            c.Pos,
+            c.KeyPos,
+            c.HeadSize,
+            q,
+            k,
+            v,
+        )
         attn_output = attn_output.rearrange((..., "position", "heads", "head_size"))
         attn_output = self.out_proj(attn_output)
         return attn_output
