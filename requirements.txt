@@ -12,3 +12,4 @@ haliax
 jaxtyping
 safetensors
 transformers
+google-cloud-storage

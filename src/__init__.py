@@ -1,3 +1,2 @@
-import jax
-
-jax.config.update("jax_default_device", jax.devices()[0])
+from jax import config, devices
+config.update("jax_default_device", devices('cpu')[0])

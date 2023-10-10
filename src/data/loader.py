@@ -3,7 +3,10 @@ from dataclasses import dataclass
 from typing import Any, Iterable, Callable, Optional, Dict
 
 import jax
+import jax.numpy as jnp
 import pypeln as pl
+from jax.experimental import mesh_utils
+from jax.sharding import PositionalSharding
 from rand_archive import Reader
 
 import src.data.transforms as T
@@ -29,6 +32,11 @@ class DataLoader:
         self.transforms: Dict[str, Optional[Callable]] = {stage: None for stage in ['train', 'val', 'test']}
         self.epoch = 0
 
+        self.sharding = PositionalSharding(mesh_utils.create_device_mesh(
+            (8,),
+            jax.devices('tpu'))
+        )
+
     def _build_reader(self, stage) -> Iterable[Any]:
         reader = Reader().by_count(64)
 
@@ -47,19 +55,25 @@ class DataLoader:
         if stage == 'train' and self.config.shuffle:
             loader = loader.with_shuffling(self._epoch_seed())
 
+        to_tensors = lambda x: VideoSample(**pickle.loads(x[1])).sample_frames(self.config.n_frames).to_tensors()
         loader = (
             pl.sync.from_iterable(iter(loader))
-            | pl.thread.map(lambda x: VideoSample(**pickle.loads(x[1])), workers=12, maxsize=32)
-            | pl.thread.map(lambda x: x.sample_frames(self.config.n_frames).to_tensors(), workers=4, maxsize=16)
+            | pl.thread.map(to_tensors, workers=12, maxsize=32)
         )
 
-        if self.transforms[stage] is not None:
-            loader = loader | pl.sync.map(lambda x: self.transforms[stage](x), workers=2, maxsize=32)
-
         if self.config.batch_size > 1:
-            loader = (
-                Batcher(loader, self.config.batch_size)
+            loader = pl.sync.from_iterable(Batcher(loader, 2, self.config.batch_size))
+
+        def put_device(x):
+            x = (jnp.asarray(x[0]), jnp.asarray(x[1]))
+            return (
+                jax.device_put(x[0], self.sharding),
+                jax.device_put(x[1], self.sharding.reshape((8, 1, 1, 1, 1))),
             )
+        loader = loader | pl.thread.map(put_device, workers=4, maxsize=32)
+
+        if self.transforms[stage] is not None:
+            loader = loader | pl.sync.map(lambda x: self.transforms[stage](x))
 
         return loader
 
@@ -84,12 +98,14 @@ class SSV2(DataLoader):
     def __init__(self, config: DLConfig):
         super().__init__('ssv2', config)
         key = jax.random.key(config.base_seed)
+        dummy = jnp.ones((config.batch_size, config.n_frames, 3, 224, 224), dtype=jnp.uint8)
         self.transforms = {
             'train': T.TrivialAugment([
                 T.FlipHorizontal(),
-                T.Shear('x', (0, 1)),
-                T.Shear('y', (0, 1)),
-                T.Rotate((0, 360)),
+                T.Shear('x', (0, 0.99)),
+                T.Shear('y', (0, 0.99)),
+                T.Rotate((0, 135.0)),
                 T.Invert(),
-            ], key=key, debug=True),
+            ], key=key),
         }
+        self.transforms['train'].warmup(dummy)

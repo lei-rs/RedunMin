@@ -113,7 +113,7 @@ class VideoSample(BaseModel):
         return self
 
     def to_arrays(self) -> Tuple[np.ndarray, np.ndarray]:
-        return np.array(int(self.cls)), np.asarray(self.video.frames).transpose(0, 3, 1, 2)
+        return np.array(int(self.cls)), np.asarray(self.video.frames, dtype=np.uint8).transpose(0, 3, 1, 2)
 
     def to_tensors(self) -> Tuple[jnp.ndarray, jnp.ndarray]:
         cls, vid = self.to_arrays()

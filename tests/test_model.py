@@ -23,7 +23,7 @@ class TestLQViT(TestCase):
         )
         LQViT.from_pretrained(
             'google/vit-base-patch16-224',
-            'data/vit_vit-base-16-224.safetensors',
+            'gs://redunmin-us/vit/vit-base-16-224.safetensors',
             cfg,
             key=key,
         )

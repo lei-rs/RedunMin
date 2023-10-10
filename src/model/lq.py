@@ -5,9 +5,10 @@ import equinox as eqx
 import haliax as hax
 import haliax.nn as hnn
 import jax.random as jrand
+from google.cloud import storage
 from haliax import NamedArray, Axis
 from haliax.jax_utils import named_call, maybe_rng_split
-from safetensors.numpy import load_file
+from safetensors.numpy import load
 from transformers import ViTConfig as HFViTConfig
 
 from .levanter.safetensor import STSerde
@@ -125,7 +126,13 @@ class LQViT(eqx.Module, STSerde):
         vit_cfg = ViTConfig.from_hf_config(HFViTConfig.from_pretrained(name), flash_attn)
         config = config.add_vit_cfg(vit_cfg)
         slf = LQViT.init(config, key=key)
-        sd = load_file(path)
+
+        if path.startswith('gs://'):
+            client = storage.Client()
+            bucket = client.get_bucket(path.split('/')[2])
+            blob = bucket.blob('/'.join(path.split('/')[3:]))
+            sd = load(blob.download_as_bytes())
+
         slf.vit_encoder.from_state_dict(sd, prefix='encoder')
         return slf
 
