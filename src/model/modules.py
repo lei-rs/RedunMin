@@ -2,7 +2,7 @@ from typing import Callable, Optional, Dict
 
 import equinox as eqx
 import haliax.nn as hnn
-import jax.random as jrand
+import jax.random as jax_rand
 from haliax import Axis, NamedArray
 from haliax.jax_utils import named_call
 
@@ -32,7 +32,7 @@ class FeedForward(eqx.Module, Serialize):
             out_first: bool = False,
             sd_key_map=None,
     ) -> 'FeedForward':
-        k_to_embed, k_from_embed = jrand.split(key)
+        k_to_embed, k_from_embed = jax_rand.split(key)
 
         to_hidden = hnn.Linear.init(Out=Hidden, In=In, key=k_to_embed, use_bias=use_bias, out_first=out_first)
         from_hidden = hnn.Linear.init(Out=In, In=Hidden, key=k_from_embed, use_bias=use_bias, out_first=out_first)
@@ -53,7 +53,7 @@ class FeedForward(eqx.Module, Serialize):
 
     @named_call
     def __call__(self, x: NamedArray, *, key) -> NamedArray:
-        k_dropout = jrand.split(key, 1)
+        k_dropout = jax_rand.split(key, 1)
         x = self.to_hidden(x)
         x = self.act(x)
         if self.dropout is not None:
@@ -84,7 +84,7 @@ class Attention(eqx.Module, Serialize):
         key,
         use_bias: bool = False,
     ) -> 'Attention':
-        k_qkv, k_out = jrand.split(key, 2)
+        k_qkv, k_out = jax_rand.split(key, 2)
         QKV = Axis(name="qkv", size=3)
         qkv_proj = hnn.Linear.init(In=Embed, Out=(QKV, Heads, HeadSize), key=k_qkv, use_bias=use_bias)
         out_proj = hnn.Linear.init(In=(Heads, HeadSize), Out=Embed, key=k_out, use_bias=use_bias)

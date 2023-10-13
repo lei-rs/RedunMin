@@ -5,7 +5,7 @@ import haliax as hax
 import haliax.nn as hnn
 import jax
 import jax.numpy as jnp
-import jax.random as jrand
+import jax.random as jax_rand
 import jax_dataclasses as jdc
 from google.cloud import storage
 from haliax import NamedArray, Axis
@@ -122,10 +122,10 @@ class RegPool(eqx.Module):
         Heads = cfg.vit_config.Heads
         HeadSize = cfg.vit_config.HeadSize
 
-        key, k_q = jrand.split(key, 2)
+        key, k_q = jax_rand.split(key, 2)
         queries = hax.random.normal(k_q, (TOut, Embed))
 
-        k_q, k_kv, k_out = jrand.split(key, 3)
+        k_q, k_kv, k_out = jax_rand.split(key, 3)
         KV = Axis(name='kv', size=2)
         q_proj = hnn.Linear.init(In=Embed, Out=(Heads, HeadSize), key=k_q, use_bias=use_bias)
         kv_proj = hnn.Linear.init(In=Embed, Out=(KV, Heads, HeadSize), key=k_kv, use_bias=use_bias)
@@ -178,7 +178,7 @@ class GAPCls(eqx.Module):
 
     @staticmethod
     def init(Embed: Axis, Cls: Axis, *, key) -> 'GAPCls':
-        key = jrand.split(key, 1)
+        key = jax_rand.split(key, 1)
         linear = hnn.Linear.init(Out=Cls, In=Embed, key=key, use_bias=True)
         return GAPCls(
             linear=linear
@@ -202,7 +202,7 @@ class LQViT(eqx.Module, Serialize):
     @staticmethod
     def init(config: LQViTConfig, *, key) -> 'LQViT':
         assert config.vit_config is not None, "Missing config for ViT"
-        patch_key, pe_key, lq_key, vit_key, cls_key = jrand.split(key, 5)
+        patch_key, pe_key, lq_key, vit_key, cls_key = jax_rand.split(key, 5)
 
         TFirst = Axis(name='temporal', size=config.t_dims[0])
 
@@ -249,7 +249,7 @@ class LQViT(eqx.Module, Serialize):
 
     @named_call
     def __call__(self, x: NamedArray, *, key) -> NamedArray:
-        _, key_vit = jrand.split(key)
+        _, key_vit = jax_rand.split(key)
         x = self.patch_embed(x)
         x = x + self.pos_embed
         x = self.pool(x)

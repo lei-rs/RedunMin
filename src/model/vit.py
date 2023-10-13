@@ -2,7 +2,7 @@ from typing import Callable, Optional, Dict
 
 import equinox as eqx
 import haliax.nn as hnn
-import jax.random as jrand
+import jax.random as jax_rand
 import jax_dataclasses as jdc
 from haliax import Axis, NamedArray
 from haliax.jax_utils import named_call, shaped_rng_split
@@ -94,7 +94,7 @@ class ViTMLP(eqx.Module, Serialize):
             use_bias: bool = False,
             dropout: float = 0.1,
     ) -> 'ViTMLP':
-        k_to_embed, k_from_embed = jrand.split(key, 2)
+        k_to_embed, k_from_embed = jax_rand.split(key, 2)
 
         to_hidden = hnn.Linear.init(Out=Mlp, In=Embed, key=k_to_embed, use_bias=use_bias)
         from_hidden = hnn.Linear.init(Out=Embed, In=Mlp, key=k_from_embed, use_bias=use_bias)
@@ -114,7 +114,7 @@ class ViTMLP(eqx.Module, Serialize):
 
     @named_call
     def __call__(self, x: NamedArray, *, key) -> NamedArray:
-        _, k_dropout = jrand.split(key, 2)
+        _, k_dropout = jax_rand.split(key, 2)
         x = self.to_hidden(x)
         x = self.act(x)
         x = self.dropout(x, key=k_dropout, inference=self.inference)
@@ -184,7 +184,7 @@ class ViTAttention(eqx.Module, Serialize):
     def init(config: ViTConfig, *, key) -> 'ViTAttention':
         use_bias = config.qkv_bias
         Embed = config.Embed
-        k_q, k_k, k_v, k_out = jrand.split(key, 4)
+        k_q, k_k, k_v, k_out = jax_rand.split(key, 4)
         q_proj = hnn.Linear.init(In=Embed, Out=(config.Heads, config.HeadSize), key=k_q, use_bias=use_bias)
         k_proj = hnn.Linear.init(In=Embed, Out=(config.Heads, config.HeadSize), key=k_k, use_bias=use_bias)
         v_proj = hnn.Linear.init(In=Embed, Out=(config.Heads, config.HeadSize), key=k_v, use_bias=use_bias)
@@ -307,7 +307,7 @@ class VitEncoderLayer(eqx.Module, Serialize):
 
     @staticmethod
     def init(config: ViTConfig, *, key) -> 'VitEncoderLayer':
-        k_attn, key_mlp = jrand.split(key, 2)
+        k_attn, key_mlp = jax_rand.split(key, 2)
         attention = ViTAttention.init(config, key=k_attn)
         mlp = ViTMLP.init(config.Embed, config.Mlp, config.hidden_act, key=key_mlp)
         ln1 = hnn.LayerNorm.init(config.Embed, eps=config.layer_norm_eps)
@@ -322,7 +322,7 @@ class VitEncoderLayer(eqx.Module, Serialize):
 
     @named_call
     def __call__(self, x: NamedArray, *, key) -> NamedArray:
-        _, k_mlp = jrand.split(key, 2)
+        _, k_mlp = jax_rand.split(key, 2)
         x = self.ln1(x)
         attn_output = self.attention(x)
         x = x + attn_output
@@ -357,7 +357,7 @@ class ViTEncoder(eqx.Module, Serialize):
 
     @named_call
     def __call__(self, x: NamedArray, *, key) -> NamedArray:
-        keys = jrand.split(key, self.config.num_hidden_layers)
+        keys = jax_rand.split(key, self.config.num_hidden_layers)
         x = self.layers.fold(x, key=keys)
         return x
 
