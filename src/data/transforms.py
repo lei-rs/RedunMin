@@ -226,3 +226,6 @@ class Normalize(Augment):
             jnp.array([0.485, 0.456, 0.406]),
             jnp.array([0.229, 0.224, 0.225])
         )
+
+    def warmup(self, video: ndarray):
+        self._call(video)

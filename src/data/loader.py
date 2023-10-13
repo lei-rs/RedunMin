@@ -1,9 +1,8 @@
 import pickle
 from dataclasses import dataclass
-from typing import Any, Iterable, Callable, Optional, Dict
+from typing import Any, Iterable, Callable, Optional, Dict, List
 
 import jax
-import jax.numpy as jnp
 import pypeln as pl
 from rand_archive import Reader
 
@@ -35,7 +34,7 @@ class DataLoader:
         self.config = config
 
         self.readers = {stage: self._build_reader(stage) for stage in ['train', 'val', 'test']}
-        self.transforms: Dict[str, Optional[Callable]] = {stage: None for stage in ['train', 'val', 'test']}
+        self.transforms: Dict[str, Optional[List[Callable]]] = default_transforms(jax.random.PRNGKey(config.base_seed))
         self.epoch = 0
 
     def _build_reader(self, stage) -> Iterable[Any]:
@@ -56,7 +55,8 @@ class DataLoader:
         if stage == 'train' and self.config.shuffle:
             loader = loader.with_shuffling(self._epoch_seed())
 
-        to_tensors = lambda x: VideoSample(**pickle.loads(x[1])).sample_frames(self.config.n_frames).to_tensors()
+        def to_tensors(x):
+            VideoSample(**pickle.loads(x[1])).sample_frames(self.config.n_frames).to_tensors()
         loader = (
             pl.sync.from_iterable(iter(loader))
             | pl.thread.map(to_tensors, workers=12, maxsize=32)
@@ -90,10 +90,3 @@ class DataLoader:
     def test_loader(self) -> Iterable[Any]:
         return self._get_loader('test')
 
-
-class SSV2(DataLoader):
-    def __init__(self, config: DLConfig):
-        super().__init__('ssv2', config)
-        key = jax.random.key(config.base_seed)
-        dummy = jnp.ones((config.batch_size, config.n_frames, 3, 224, 224), dtype=jnp.uint8)
-        self.transforms = default_transforms(key)

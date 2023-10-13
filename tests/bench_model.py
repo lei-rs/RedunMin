@@ -14,71 +14,64 @@ Pos = hax.Axis(name='position', size=196 * 8)
 Embed = hax.Axis(name='embed', size=768)
 
 
-def make_model() -> LQViT:
+@hax.named_jit
+def make_model(mapping):
     key = jrand.PRNGKey(0)
-    cfg = LQViTConfig(
-        32,
-        8,
-        400
-    )
-    return LQViT.from_pretrained(
-        'google/vit-base-patch16-224',
-        'gs://redunmin-us/vit/vit-base-16-224.safetensors',
-        cfg,
-        key=key,
-        dtype=jnp.bfloat16
-    )
-
-
-def test_bench_baseline_encoder(benchmark):
-    key = jrand.PRNGKey(0)
-
-    mesh = mesh_utils.create_device_mesh((4, 2), jax.devices('tpu'), contiguous_submeshes=True)
-    mesh = Mesh(mesh, ('data', 'model'))
-    model_sharding = NamedSharding(mesh, PartitionSpec('model', None))
-    x_sharding = NamedSharding(mesh, PartitionSpec('data', None, None))
-
-    x = jnp.ones((8, 196 * 8, 768), dtype=jnp.bfloat16)
-    model = FlaxViTEncoder(HFViTConfig(), jnp.bfloat16)
-
-    x = jax.device_put(x, x_sharding)
-
-    params = model.init(key, x)
-    forward = jax.jit(model.apply)
-    forward(params, x)
-    benchmark(forward, params, x)
-
-
-def test_bench_encoder_ddp(benchmark):
-    key = jrand.PRNGKey(0)
-
-    mesh = mesh_utils.create_device_mesh((4, 2), jax.devices('tpu'), contiguous_submeshes=True)
-    mesh = Mesh(mesh, ('data', 'model'))
-
-    cfg = LQViTConfig(32, 8, 400)
+    cfg = LQViTConfig()
     model = LQViT.init(cfg, key=key).astype(jnp.bfloat16).vit_encoder
-    x = hax.ones((Batch, Pos, Embed), dtype=jnp.bfloat16)
-
-    x = hax.shard_with_axis_mapping(x, {'batch': 'data'}, mesh)
-    model = hax.shard_with_axis_mapping(model, {'embed': 'model'}, mesh)
-
-    forward = jax.jit(model.__call__)
-    forward(x, key=key)
-    benchmark(forward, x, key=key)
+    return hax.shard_with_axis_mapping(model, mapping)
 
 
-def test_bench_encoder_fsdp(benchmark):
+@hax.named_jit
+def forward(model, x, key, mapping):
+    with hax.axis_mapping(mapping):
+        return model(x, key=key)
+
+
+def test_bench_baseline_encoder_ddp(benchmark):
     key = jrand.PRNGKey(0)
 
     mesh = Mesh(jax.devices('tpu'), 'data')
+    x_sharding = NamedSharding(mesh, PartitionSpec('data', None, None))
 
-    cfg = LQViTConfig(32, 8, 400)
-    model = LQViT.init(cfg, key=key).astype(jnp.bfloat16).vit_encoder
-    x = hax.ones((Batch, Pos, Embed), dtype=jnp.bfloat16)
+    x = jnp.ones((Batch.size, Pos.size, Embed.size), dtype=jnp.bfloat16)
+    model = FlaxViTEncoder(HFViTConfig(), jnp.bfloat16)
 
-    x = hax.shard_with_axis_mapping(x, {'batch': 'data'}, mesh)
-    model = hax.shard_with_axis_mapping(model, {'embed': 'data'}, mesh)
+    x = jax.device_put(x, x_sharding)
+    params = model.init(key, x)
 
-    forward = jax.jit(model.__call__)
-    forward(x, key=key)
-    benchmark(forward, x, key=key)
+    fwd = jax.jit(model.apply)
+    forward = lambda: jax.block_until_ready(fwd(params, x))
+    forward()
+    benchmark(forward)
+
+
+def test_bench_encoder_ddp(benchmark):
+    mesh = mesh_utils.create_device_mesh((4, 2), jax.devices('tpu'), contiguous_submeshes=True)
+    mesh = Mesh(mesh, ('data', 'model'))
+    compute_axis_mapping = {'batch': 'data'}
+    param_axis_mapping = {'embed': 'model'}
+
+    with mesh:
+        key = jrand.PRNGKey(1)
+        x = hax.ones((Batch, Pos, Embed), dtype=jnp.bfloat16)
+        x = hax.shard_with_axis_mapping(x, compute_axis_mapping)
+        model = make_model(param_axis_mapping)
+        fwd = lambda: jax.block_until_ready(forward(model, x, key=key, mapping=compute_axis_mapping))
+        fwd()
+        benchmark(fwd)
+
+
+def test_bench_encoder_fsdp(benchmark):
+    mesh = Mesh(jax.devices('tpu'), 'data')
+    compute_axis_mapping = {'batch': 'data'}
+    param_axis_mapping = {'embed': 'data'}
+
+    with mesh:
+        key = jrand.PRNGKey(1)
+        x = hax.ones((Batch, Pos, Embed), dtype=jnp.bfloat16)
+        x = hax.shard_with_axis_mapping(x, compute_axis_mapping)
+        model = make_model(param_axis_mapping)
+        fwd = lambda: jax.block_until_ready(forward(model, x, key=key, mapping=compute_axis_mapping))
+        fwd()
+        benchmark(fwd)

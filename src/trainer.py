@@ -7,7 +7,6 @@ import haliax as hax
 import jax
 import optax
 import pypeln as pl
-from jax.experimental import mesh_utils
 from jax.numpy import ndarray, asarray
 from jax.sharding import Mesh
 from tqdm import tqdm
@@ -15,55 +14,60 @@ from tqdm import tqdm
 from .data.loader import DataLoader
 from .model.lq import LQViT
 
-
 compute_axis_mapping = {"batch": "data"}
 param_axis_mapping = {"embed": "data"}
-mesh = Mesh(
-    mesh_utils.create_device_mesh(
-        (4, 2),
-        jax.devices('tpu'),
-        contiguous_submeshes=True
-        ),
-    ('data', 'model')
-)
 
 
-def calc_loss(model, x, y, loss_fn):
+def _calc_loss(model, x, y, loss_fn):
     pred_y = model(x)
     return loss_fn(pred_y, y)
 
 
-def calc_loss_partial(diff_model, static_model, x, y, loss_fn):
+def _calc_loss_partial(diff_model, static_model, x, y, loss_fn):
     model = eqx.combine(diff_model, static_model)
     pred_y = model(x)
     return loss_fn(pred_y, y)
 
 
-@dataclass(init=True, repr=True, frozen=True)
-class OptimConfig:
-    lr: float = 1e-4
-    weight_decay: float = 0.1
+@hax.named_jit
+def _init_optimizer(optimizer, model):
+    opt_state = optimizer.init(model)
+    return hax.shard_with_axis_mapping(opt_state, param_axis_mapping)
 
 
 @dataclass(init=True, repr=True, frozen=True)
 class TrainerConfig:
     max_epochs: int
     loss_fn: Callable
-    optim_cfg: OptimConfig
-    optim = optax.adamw
+    optim_cfg: Dict
+    optim: Callable
     metrics: Dict[str, Callable] = None
+    distributed: bool = False
 
     def make_optimizer(self):
         return self.optim(**self.optim_cfg)
+
+    def build_mesh(self):
+        if self.distributed:
+            jax.distributed.initialize()
+        return Mesh(
+            jax.devices('tpu'),
+            'data'
+        )
+
+    @staticmethod
+    def filter_spec(epoch):
+        return None
 
 
 class Trainer:
     def __init__(self, config: TrainerConfig, model: LQViT, data: DataLoader):
         self.config = config
+        self.mesh = config.build_mesh()
         self.model = model = hax.shard_with_axis_mapping(
             model,
             param_axis_mapping,
-            mesh
+            self.mesh
         )
         self.optim = config.make_optimizer()
         self.dl = data
@@ -78,22 +82,15 @@ class Trainer:
             hax.shard_with_axis_mapping(
                 asarray(x_i),
                 compute_axis_mapping,
-                mesh
             ) for x_i in x
         ])
 
-    @staticmethod
-    @hax.named_jit
-    def _init_optimizer(optimizer, model):
-        opt_state = optimizer.init(model)
-        return hax.shard_with_axis_mapping(opt_state, param_axis_mapping)
-
     def get_loss_fn(self, x, y):
-        fs = self.cfg.filter_spec(self.epoch)
+        fs = self.config.filter_spec(self.epoch)
         if fs is not None:
             diff_model, static_model = eqx.partition(self.model, fs)
             loss_fn = partial(
-                calc_loss_partial,
+                _calc_loss_partial,
                 diff_model,
                 static_model,
                 x,
@@ -102,7 +99,7 @@ class Trainer:
             )
         else:
             loss_fn = partial(
-                calc_loss,
+                _calc_loss,
                 self.model,
                 x,
                 y,
@@ -150,9 +147,10 @@ class Trainer:
             tqdm.write(msg)
 
     def train(self):
-        with mesh:
+        with self.mesh:
             self.opt_state = self._init_optimizer(self.optim, self.model)
             while self.epoch < self.config.max_epochs:
                 self.train_loop()
                 self.val_loop()
                 self.epoch += 1
+                self.dl.step()
