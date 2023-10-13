@@ -43,7 +43,7 @@ def apply_prefix(prefix: Optional[str], leaf: Optional[str]) -> Optional[str]:
 Mod = TypeVar("Mod", bound=eqx.Module)
 
 
-class STSerde:
+class Serialize:
     """An eqx.Module that can be serialized to a torch-style state dict."""
 
     def to_state_dict(self, prefix: Optional[str] = None) -> StateDict:

@@ -54,14 +54,13 @@ def test_bench_encoder_ddp(benchmark):
 
     mesh = mesh_utils.create_device_mesh((4, 2), jax.devices('tpu'), contiguous_submeshes=True)
     mesh = Mesh(mesh, ('data', 'model'))
-    model_sharding = NamedSharding(mesh, PartitionSpec('model', None))
 
     cfg = LQViTConfig(32, 8, 400)
     model = LQViT.init(cfg, key=key).astype(jnp.bfloat16).vit_encoder
     x = hax.ones((Batch, Pos, Embed), dtype=jnp.bfloat16)
 
     x = hax.shard_with_axis_mapping(x, {'batch': 'data'}, mesh)
-    model = jax.device_put(model, model_sharding)
+    model = hax.shard_with_axis_mapping(model, {'embed': 'model'}, mesh)
 
     forward = jax.jit(model.__call__)
     forward(x, key=key)

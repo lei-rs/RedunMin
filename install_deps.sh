@@ -16,4 +16,5 @@ conda create -y -n main python=3.10
 conda activate main
 
 pip install jax[tpu] -f https://storage.googleapis.com/jax-releases/libtpu_releases.html
+pip install 'haliax @ git+https://github.com/stanford-crfm/haliax.git'
 pip install -r requirements.txt

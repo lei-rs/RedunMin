@@ -1,18 +1,17 @@
-from functools import partial
-from typing import Callable, Union, Optional, Dict
+from typing import Callable, Optional, Dict
 
 import equinox as eqx
 import haliax.nn as hnn
 import jax.random as jrand
 import jax_dataclasses as jdc
 from haliax import Axis, NamedArray
-from haliax.jax_utils import named_call, maybe_rng_split, shaped_rng_split
+from haliax.jax_utils import named_call, shaped_rng_split
 from haliax.nn.scan import Stacked
 from transformers.models.vit import ViTConfig as HFViTConfig
 
 from .levanter.safetensor import (
     StateDict,
-    STSerde,
+    Serialize,
     apply_prefix,
     unstack_state_dict,
     stack_state_dict,
@@ -20,7 +19,6 @@ from .levanter.safetensor import (
     flatten_linear_layers,
 )
 
-TRAINING = True
 
 ACT2FN: Dict[str, Callable] = {
     "relu": hnn.relu,
@@ -30,14 +28,9 @@ ACT2FN: Dict[str, Callable] = {
 }
 
 
-def update_train_flag(mode: bool):
-    global TRAINING
-    TRAINING = mode
-
-
 @jdc.pytree_dataclass(init=True, repr=True)
 class ViTConfig:
-    n_patches: int = (224 ** 2 // 16 ** 2)
+    n_patches: int = (224 ** 2 // 16 ** 2) * 8
     hidden_size: int = 768
     num_hidden_layers: int = 12
     num_attention_heads: int = 12
@@ -48,7 +41,8 @@ class ViTConfig:
     layer_norm_eps: float = 1e-12
     patch_size: int = 16
     qkv_bias: bool = True
-    dropout = 0.1
+    dropout: float = 0.1
+    image_size: int = 224
 
     Pos = property(lambda self: Axis(name="position", size=self.n_patches))
     KeyPos = property(lambda self: self.Pos.alias("key_position"))
@@ -72,16 +66,23 @@ class ViTConfig:
             layer_norm_eps=hf_config.layer_norm_eps,
             patch_size=hf_config.patch_size,
             qkv_bias=hf_config.qkv_bias,
+            dropout=hf_config.hidden_dropout_prob,
+            image_size=hf_config.image_size,
         )
 
+    def n_patches_per_frame(self) -> int:
+        return self.image_size ** 2 // self.patch_size ** 2
 
-class ViTMLP(eqx.Module, STSerde):
+
+class ViTMLP(eqx.Module, Serialize):
     to_hidden: hnn.Linear
     from_hidden: hnn.Linear
-    dropout: hnn.Dropout
-    act: Callable = eqx.static_field()
 
     Embed: Axis = eqx.static_field()
+
+    act: Callable = eqx.static_field(default=hnn.gelu)
+    dropout: Optional[hnn.Dropout] = eqx.static_field(default=None)
+    inference: bool = eqx.static_field(default=False)
 
     @staticmethod
     def init(
@@ -93,28 +94,35 @@ class ViTMLP(eqx.Module, STSerde):
             use_bias: bool = False,
             dropout: float = 0.1,
     ) -> 'ViTMLP':
-        k_to_embed, k_from_embed = jrand.split(key)
+        k_to_embed, k_from_embed = jrand.split(key, 2)
 
-        to_hidden = hnn.Linear.init(Out=Mlp, In=Embed, key=k_to_embed, use_bias=use_bias, out_first=True)
-        from_hidden = hnn.Linear.init(Out=Embed, In=Mlp, key=k_from_embed, use_bias=use_bias, out_first=True)
-        dropout = hnn.Dropout(dropout, broadcast_axes=Mlp)
+        to_hidden = hnn.Linear.init(Out=Mlp, In=Embed, key=k_to_embed, use_bias=use_bias)
+        from_hidden = hnn.Linear.init(Out=Embed, In=Mlp, key=k_from_embed, use_bias=use_bias)
+        if dropout > 0:
+            dropout = hnn.Dropout(dropout, broadcast_axes=Embed)
+        else:
+            dropout = None
 
         return ViTMLP(
             to_hidden=to_hidden,
             from_hidden=from_hidden,
-            dropout=dropout,
-            act=act,
             Embed=Embed,
+            act=act,
+            dropout=dropout,
+            inference=False,
         )
 
     @named_call
-    def __call__(self, x: NamedArray, *, key=None) -> NamedArray:
-        k_dropout = maybe_rng_split(key, 1)
+    def __call__(self, x: NamedArray, *, key) -> NamedArray:
+        _, k_dropout = jrand.split(key, 2)
         x = self.to_hidden(x)
         x = self.act(x)
-        x = self.dropout(x, key=k_dropout, inference=not TRAINING)
+        x = self.dropout(x, key=k_dropout, inference=self.inference)
         x = self.from_hidden(x)
         return x
+
+    def set_inference(self, inference: bool):
+        self.inference = inference
 
     def _state_dict_key_map(self) -> Optional[Dict[str, Optional[str]]]:
         return {
@@ -122,8 +130,50 @@ class ViTMLP(eqx.Module, STSerde):
             'from_hidden': 'output.dense',
         }
 
+    def from_state_dict(self, state_dict: StateDict, prefix: Optional[str] = None):
+        d = {}
+        d.update(
+            unflatten_linear_layers(
+                apply_prefix(prefix, 'intermediate.dense'),
+                state_dict,
+                self.to_hidden,
+                True
+            )
+        )
+        d.update(
+            unflatten_linear_layers(
+                apply_prefix(prefix, 'output.dense'),
+                state_dict,
+                self.from_hidden,
+                True
+            )
+        )
+        return super().from_state_dict(d, prefix)
 
-class ViTAttention(eqx.Module, STSerde):
+    def update_state_dict(self, state_dict: StateDict, prefix: Optional[str] = None) -> StateDict:
+        my_dict: StateDict = {}
+        super().update_state_dict(my_dict, prefix=prefix)
+
+        my_dict.update(
+            flatten_linear_layers(
+                apply_prefix(prefix, 'intermediate.dense'),
+                self.to_hidden,
+                True
+            )
+        )
+        my_dict.update(
+            flatten_linear_layers(
+                apply_prefix(prefix, 'output.dense'),
+                self.from_hidden,
+                True
+            )
+        )
+
+        state_dict.update(my_dict)
+        return state_dict
+
+
+class ViTAttention(eqx.Module, Serialize):
     config: ViTConfig = eqx.static_field()
     q_proj: hnn.Linear
     k_proj: hnn.Linear
@@ -248,7 +298,7 @@ class ViTAttention(eqx.Module, STSerde):
         return state_dict
 
 
-class VitEncoderLayer(eqx.Module, STSerde):
+class VitEncoderLayer(eqx.Module, Serialize):
     config: ViTConfig = eqx.static_field()
     attention: ViTAttention
     mlp: ViTMLP
@@ -272,9 +322,9 @@ class VitEncoderLayer(eqx.Module, STSerde):
 
     @named_call
     def __call__(self, x: NamedArray, *, key) -> NamedArray:
-        k_attn, k_mlp = jrand.split(key, 2)
+        _, k_mlp = jrand.split(key, 2)
         x = self.ln1(x)
-        attn_output = self.attention(x, key=key)
+        attn_output = self.attention(x)
         x = x + attn_output
         x = self.ln2(x)
         mlp_output = self.mlp(x, key=k_mlp)
@@ -290,7 +340,7 @@ class VitEncoderLayer(eqx.Module, STSerde):
         }
 
 
-class ViTEncoder(eqx.Module, STSerde):
+class ViTEncoder(eqx.Module, Serialize):
     config: ViTConfig = eqx.static_field()
     layers: Stacked[VitEncoderLayer]
 

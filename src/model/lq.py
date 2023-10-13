@@ -1,4 +1,4 @@
-from typing import Optional, Dict
+from typing import Optional, Dict, Tuple
 
 import equinox as eqx
 import haliax as hax
@@ -9,79 +9,167 @@ import jax.random as jrand
 import jax_dataclasses as jdc
 from google.cloud import storage
 from haliax import NamedArray, Axis
-from haliax.jax_utils import named_call, maybe_rng_split
+from haliax.jax_utils import named_call
 from safetensors.numpy import load
 from transformers import ViTConfig as HFViTConfig
 
-from .levanter.safetensor import STSerde
+from .levanter.safetensor import Serialize
 from .vit import ViTConfig, ViTEncoder
 
 
 @jdc.pytree_dataclass(init=True, repr=True)
 class LQViTConfig:
-    t_in: int
-    t_out: int
-    n_classes: int
+    t_dims: Tuple[int, ...] = (32, 8)
+    n_classes: int = 400
     vit_config: ViTConfig = ViTConfig()
 
-    TIn = property(lambda self: Axis(name='time_in', size=self.t_in))
-    TOut = property(lambda self: Axis(name='time', size=self.t_out))
-    Spatial = property(lambda self: Axis(name='spatial', size=self.vit_config.n_patches))
+    Temporal = property(lambda self: Axis(name='temporal', size=self.t_dims[-1]))
+    Spatial = property(lambda self: Axis(name='spatial', size=self.vit_config.n_patches_per_frame()))
+
+    Height = property(lambda self: Axis(name='height', size=self.vit_config.image_size))
+    Width = property(lambda self: Axis(name='width', size=self.vit_config.image_size))
+    Channels = property(lambda self: Axis(name='channels', size=3))
+
     Cls = property(lambda self: Axis(name='cls', size=self.n_classes))
 
     def wrap_vit_cfg(self, cfg: ViTConfig):
         with jdc.copy_and_mutate(cfg) as cfg:
-            cfg.n_patches *= self.t_out
+            cfg.n_patches *= self.t_dims[-1]
         with jdc.copy_and_mutate(self) as slf:
             slf.vit_config = cfg
             return slf
 
 
-class LQAttention(eqx.Module):
-    config: LQViTConfig
-    queries: NamedArray
-    k_proj: hnn.Linear
-    v_proj: hnn.Linear
-    out_proj: hnn.Linear
+class PatchEmbeddings(eqx.Module):
+    conv: hnn.Conv
 
     @staticmethod
-    def init(config: LQViTConfig, *, key) -> 'LQAttention':
-        c = config.vit_config
-        use_bias = c.qkv_bias
-        Embed = c.Embed
-        k_q, k_k, k_v, k_out = jrand.split(key, 4)
-        queries = hax.random.normal(k_q, (c.Heads, config.TOut, c.HeadSize)) * 0.02
-        k_proj = hnn.Linear.init(In=Embed, Out=(c.Heads, c.HeadSize), key=k_k, use_bias=use_bias)
-        v_proj = hnn.Linear.init(In=Embed, Out=(c.Heads, c.HeadSize), key=k_v, use_bias=use_bias)
-        out_proj = hnn.Linear.init(In=(c.Heads, c.HeadSize), Out=Embed, key=k_out, use_bias=use_bias)
-        return LQAttention(
-            config=config,
-            queries=queries,
-            k_proj=k_proj,
-            v_proj=v_proj,
-            out_proj=out_proj,
+    def init(cfg: LQViTConfig, *, key):
+        patch = cfg.vit_config.patch_size
+        assert cfg.vit_config.image_size % patch == 0, 'Image size must be divisible by patch size'
+        conv = hnn.Conv.init(
+            (cfg.Height, cfg.Width),
+            cfg.Channels,
+            cfg.vit_config.Embed,
+            (patch, patch),
+            key=key,
+            stride=(patch, patch),
+        )
+        return PatchEmbeddings(
+            conv=conv,
+        )
+
+    @named_call
+    def __call__(self, x: NamedArray) -> NamedArray:
+        x = x.rearrange((..., 'height', 'width', 'channels'))
+        x = self.conv(x)
+        x = x.flatten_axes(('height', 'width'), 'spatial')
+        x = x.rename({'channels': 'embed'})
+        return x
+
+
+class RevN(eqx.Module):
+    Norm: Axis = eqx.static_field()
+
+    affine: Optional[NamedArray] = None
+    bias: Optional[NamedArray] = None
+    eps: float = 1e-5
+
+    @staticmethod
+    def init(Norm: Axis, Embed: Axis, *, key=None, affine=True, eps=1e-5) -> 'RevN':
+        if affine:
+            affine = hax.ones(Embed)
+            bias = hax.zeros(Embed)
+        return RevN(
+            Norm=Norm,
+            affine=affine,
+            bias=bias,
+            eps=eps,
         )
 
     @named_call
     def __call__(self, x: NamedArray, *, key=None) -> NamedArray:
-        c = self.config
+        mu = hax.mean(x, self.Temporal)
+        var = hax.var(x, self.Temporal)
+        x = (x - mu) / hax.sqrt(var + self.eps)
+        if self.affine is not None:
+            x = x * self.affine + self.bias
+        return x, mu, var
 
-        x = x.rearrange((..., "spatial", "time_in", "embed"))
-        k = self.k_proj(x).rearrange((..., "heads", "time_in", "head_size"))
-        v = self.v_proj(x).rearrange((..., "heads", "time_in", "head_size"))
+    @named_call
+    def reverse(self, x: NamedArray, mu: NamedArray, sigma: NamedArray, *, key=None) -> NamedArray:
+        if self.affine is not None:
+            x = (x - self.bias) / self.affine
+        x = x * hax.sqrt(sigma + self.eps) + mu
+        return x
 
-        attn_output = hnn.attention.dot_product_attention(
-            QPos=c.TOut,
-            KPos=c.TIn,
-            KeySize=c.vit_config.HeadSize,
-            query=self.queries,
-            key=k,
-            value=v,
+
+class RegPool(eqx.Module):
+    queries: NamedArray
+    q_proj: hnn.Linear
+    kv_proj: hnn.Linear
+    out_proj: hnn.Linear
+
+    TIn: Axis = eqx.static_field()
+    TOut: Axis = eqx.static_field()
+    HeadSize: Axis = eqx.static_field()
+
+    @staticmethod
+    def init(cfg: LQViTConfig, t_in: int, t_out: int, *, key, use_bias=True) -> 'RegPool':
+        TIn = Axis(name='temporal', size=t_in)
+        TOut = Axis(name='temp_out', size=t_out)
+        Embed = cfg.vit_config.Embed
+        Heads = cfg.vit_config.Heads
+        HeadSize = cfg.vit_config.HeadSize
+
+        key, k_q = jrand.split(key, 2)
+        queries = hax.random.normal(k_q, (TOut, Embed))
+
+        k_q, k_kv, k_out = jrand.split(key, 3)
+        KV = Axis(name='kv', size=2)
+        q_proj = hnn.Linear.init(In=Embed, Out=(Heads, HeadSize), key=k_q, use_bias=use_bias)
+        kv_proj = hnn.Linear.init(In=Embed, Out=(KV, Heads, HeadSize), key=k_kv, use_bias=use_bias)
+        out_proj = hnn.Linear.init(In=(Heads, HeadSize), Out=Embed, key=k_out, use_bias=use_bias)
+
+        return RegPool(
+            queries=queries,
+            q_proj=q_proj,
+            kv_proj=kv_proj,
+            out_proj=out_proj,
+            TIn=TIn,
+            TOut=TOut,
+            HeadSize=HeadSize,
         )
 
-        attn_output = attn_output.rearrange((..., "time", "heads", "head_size"))
+    @named_call
+    def __call__(self, x: NamedArray, *, key=None) -> NamedArray:
+        x = x.rearrange((..., 'spatial', 'temporal', 'embed'))
+        q = hax.broadcast_to(
+            self.queries.rename({'temp_out': 'temporal'}),
+            x.axes[:-2],
+            enforce_no_extra_axes=False
+        )
+        x = hax.concatenate('temporal', [x, q])
+        return self.pool(x)
+
+    @named_call
+    def pool(self, x: NamedArray, *, key=None) -> NamedArray:
+        q = x['temporal', -self.TOut.size:].rename({'temporal': 'temp_out'})
+        kv = x['temporal', :self.TIn.size]
+        q = self.q_proj(q)
+        kv = self.kv_proj(kv)
+        k, v = kv.unbind('kv')
+        attn_output = hnn.attention.dot_product_attention(
+            self.TOut,
+            self.TIn,
+            self.HeadSize,
+            q,
+            k,
+            v,
+        )
+        attn_output = attn_output.rearrange((..., 'temp_out', 'heads', 'head_size'))
         attn_output = self.out_proj(attn_output)
-        attn_output = hax.flatten_axes(attn_output, ("spatial", "time"), "position")
+        attn_output = attn_output.rename({'temp_out': 'temporal'})
         return attn_output
 
 
@@ -102,25 +190,40 @@ class GAPCls(eqx.Module):
         return self.linear(x)
 
 
-class LQViT(eqx.Module, STSerde):
+class LQViT(eqx.Module, Serialize):
     config: LQViTConfig
 
-    lq_atten: LQAttention
+    patch_embed: PatchEmbeddings
+    pos_embed: NamedArray
+    pool: RegPool
     vit_encoder: ViTEncoder
     cls_head: GAPCls
 
     @staticmethod
     def init(config: LQViTConfig, *, key) -> 'LQViT':
         assert config.vit_config is not None, "Missing config for ViT"
-        lq_key, vit_key, cls_key = jrand.split(key, 3)
+        patch_key, pe_key, lq_key, vit_key, cls_key = jrand.split(key, 5)
 
-        lq_atten = LQAttention.init(config, key=lq_key)
+        TFirst = Axis(name='temporal', size=config.t_dims[0])
+
+        patch_embed = PatchEmbeddings.init(config, key=patch_key)
+        pos_embed = hax.random.normal(
+            pe_key,
+            (
+                TFirst,
+                config.Spatial,
+                config.vit_config.Embed
+            )
+        )
+        pool = RegPool.init(config, config.t_dims[0], config.t_dims[-1], key=lq_key)
         vit_encoder = ViTEncoder.init(config.vit_config, key=vit_key)
         cls_head = GAPCls.init(config.vit_config.Embed, config.Cls, key=cls_key)
 
         return LQViT(
             config=config,
-            lq_atten=lq_atten,
+            patch_embed=patch_embed,
+            pos_embed=pos_embed,
+            pool=pool,
             vit_encoder=vit_encoder,
             cls_head=cls_head,
         )
@@ -142,14 +245,17 @@ class LQViT(eqx.Module, STSerde):
         slf.vit_encoder.from_state_dict(sd, prefix='encoder')
         if dtype is not None:
             slf = slf.astype(dtype)
-        return
+        return slf
 
     @named_call
-    def __call__(self, x: NamedArray, *, key=None) -> NamedArray:
-        key_atten, key_encoder, key_cls = maybe_rng_split(key, 3)
-        x = self.lq_atten(x, key=key_atten)
-        x = self.vit_encoder(x, key=key_encoder)
-        x = self.cls_head(x, key=key_cls)
+    def __call__(self, x: NamedArray, *, key) -> NamedArray:
+        _, key_vit = jrand.split(key)
+        x = self.patch_embed(x)
+        x = x + self.pos_embed
+        x = self.pool(x)
+        x = x.flatten_axes(('spatial', 'temporal'), 'position')
+        x = self.vit_encoder(x, key=key_vit)
+        x = self.cls_head(x)
         x = hnn.softmax(x, axis="cls")
         return x
 

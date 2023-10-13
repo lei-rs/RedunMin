@@ -10,7 +10,7 @@ from jax.scipy.ndimage import map_coordinates
 
 class Augment:
     @staticmethod
-    def _f():
+    def _t():
         raise NotImplementedError
 
     def _call(self, video: ndarray, *, key=None) -> ndarray:
@@ -173,7 +173,7 @@ class Invert(Augment):
 
 
 class TrivialAugment:
-    def __init__(self, augments: List[Augment], bins: int = 10, *, key, debug=False):
+    def __init__(self, augments: List[Augment], bins: int = 20, *, key, debug=False):
         self.augments = augments
         self.strengths = jnp.linspace(0, 1, bins)
         self.key = key
@@ -193,3 +193,36 @@ class TrivialAugment:
             for aug in self.augments:
                 aug.update_strength(strength)
                 aug(video, key=self.key)
+
+    @classmethod
+    def default(cls, *, key):
+        augs = [
+            FlipHorizontal(),
+            Shear('x', (0, 0.99)),
+            Shear('y', (0, 0.99)),
+            Rotate((0, 135.0)),
+            Invert(),
+        ]
+        return cls(augs, key=key)
+
+
+class Normalize(Augment):
+    def __init__(self, mean: ndarray, std: ndarray, dtype: jnp.dtype = jnp.bfloat16):
+        self.mean = mean.astype(dtype)
+        self.std = std.astype(dtype)
+
+    @staticmethod
+    @jax.jit
+    def _t(video: ndarray, mean: ndarray, std: ndarray, dtype: jnp.dtype):
+        video = video.astype(dtype)
+        return (video - mean) / std
+
+    def _call(self, video: ndarray, *, key=None) -> ndarray:
+        return self._t(video, self.mean, self.std)
+
+    @classmethod
+    def default(cls):
+        return cls(
+            jnp.array([0.485, 0.456, 0.406]),
+            jnp.array([0.229, 0.224, 0.225])
+        )
