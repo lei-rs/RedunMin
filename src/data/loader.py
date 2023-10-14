@@ -1,6 +1,6 @@
 import pickle
 from dataclasses import dataclass
-from typing import Any, Iterable, Callable, Optional, Dict, List
+from typing import Any, Iterable, Callable, Optional, Dict, List, Tuple
 
 import jax
 import pypeln as pl
@@ -55,8 +55,8 @@ class DataLoader:
         if stage == 'train' and self.config.shuffle:
             loader = loader.with_shuffling(self._epoch_seed())
 
-        def to_tensors(x):
-            VideoSample(**pickle.loads(x[1])).sample_frames(self.config.n_frames).to_tensors()
+        def to_tensors(x: Tuple[str, bytes]):
+            return VideoSample(**pickle.loads(x[1])).sample_frames(self.config.n_frames).to_tensors()
         loader = (
             pl.sync.from_iterable(iter(loader))
             | pl.thread.map(to_tensors, workers=12, maxsize=32)
@@ -90,3 +90,18 @@ class DataLoader:
     def test_loader(self) -> Iterable[Any]:
         return self._get_loader('test')
 
+    def len(self, stage: str) -> int:
+        raise NotImplementedError
+
+
+class SSV2(DataLoader):
+    def __init__(self, config: DLConfig):
+        super().__init__('ssv2', config)
+        self._len = {
+            'train': 220_847,
+            'val': 24_777,
+            'test': 27_157
+        }
+
+    def len(self, stage: str) -> int:
+        return self._len[stage]

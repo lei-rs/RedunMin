@@ -53,7 +53,7 @@ class ViTConfig:
     HeadSize = property(lambda self: Axis(name="head_size", size=self.hidden_size // self.num_attention_heads))
 
     @classmethod
-    def from_hf_config(cls, hf_config: HFViTConfig) -> 'ViTConfig':
+    def from_hf_config(cls, hf_config: HFViTConfig):
         return ViTConfig(
             n_patches=(hf_config.image_size ** 2 // hf_config.patch_size ** 2),
             hidden_size=hf_config.hidden_size,
@@ -88,9 +88,9 @@ class ViTMLP(eqx.Module, Serialize):
     def init(
             Embed: Axis,
             Mlp: Axis,
-            act: Callable,
             *,
             key,
+            act: Callable = hnn.gelu,
             use_bias: bool = False,
             dropout: float = 0.1,
     ) -> 'ViTMLP':
@@ -130,7 +130,7 @@ class ViTMLP(eqx.Module, Serialize):
             'from_hidden': 'output.dense',
         }
 
-    def from_state_dict(self, state_dict: StateDict, prefix: Optional[str] = None):
+    def from_state_dict(self, state_dict: StateDict, prefix: Optional[str] = None) -> 'ViTMLP':
         d = {}
         d.update(
             unflatten_linear_layers(
@@ -309,7 +309,7 @@ class VitEncoderLayer(eqx.Module, Serialize):
     def init(config: ViTConfig, *, key) -> 'VitEncoderLayer':
         k_attn, key_mlp = jax_rand.split(key, 2)
         attention = ViTAttention.init(config, key=k_attn)
-        mlp = ViTMLP.init(config.Embed, config.Mlp, config.hidden_act, key=key_mlp)
+        mlp = ViTMLP.init(config.Embed, config.Mlp, key=key_mlp, act=config.hidden_act, use_bias=True)
         ln1 = hnn.LayerNorm.init(config.Embed, eps=config.layer_norm_eps)
         ln2 = hnn.LayerNorm.init(config.Embed, eps=config.layer_norm_eps)
         return VitEncoderLayer(

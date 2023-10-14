@@ -9,11 +9,7 @@ from jax.scipy.ndimage import map_coordinates
 
 
 class Augment:
-    @staticmethod
-    def _t():
-        raise NotImplementedError
-
-    def _call(self, video: ndarray, *, key=None) -> ndarray:
+    def _call(self, video: ndarray, *, key) -> ndarray:
         raise NotImplementedError
 
     def __call__(self, video: Union[ndarray, Tuple[ndarray, ...]], *, key=None) -> Union[ndarray, Tuple[ndarray, ...]]:
@@ -26,59 +22,6 @@ class Augment:
         raise NotImplementedError
 
 
-class Cutout(Augment):
-    def __init__(self, max_num_crops: int, crop_size_range: tuple, fill: int = 0):
-        self.max_num_crops = max_num_crops
-        self.num_crops = max_num_crops // 2
-        self.crop_size_range = crop_size_range
-        self.fill = fill
-
-    @staticmethod
-    def _cutout(video: ndarray, num_crops: int, crop_size_range: tuple, *, key, fill: int = 0):
-        T, C, H, W = video.shape
-        key = jax.random.split(key, 4)
-        crop_height = jax.random.randint(
-            key[0],
-            [num_crops],
-            crop_size_range[0],
-            crop_size_range[1] + 1,
-        )
-        crop_width = jax.random.randint(
-            key[1],
-            [num_crops],
-            crop_size_range[0],
-            crop_size_range[1] + 1,
-        )
-        coord_h = jax.random.randint(
-            key[2],
-            [num_crops],
-            0,
-            H - crop_height
-        )
-        coord_w = jax.random.randint(
-            key[3],
-            [num_crops],
-            0,
-            W - crop_width
-        )
-        for i in range(num_crops):
-            video.at[:, :, coord_h[0]:coord_h[0] + crop_height[i], coord_w[1]:coord_w[1] + crop_width[i]].set(fill)
-
-        return video
-
-    def _call(self, video: ndarray, *, key) -> ndarray:
-        return self._cutout(
-            video,
-            self.num_crops,
-            self.crop_size_range,
-            key=key,
-            fill=self.fill
-        )
-
-    def update_strength(self, strength: float):
-        self.num_crops = int(self.max_num_crops * strength)
-
-
 class FlipHorizontal(Augment):
     @staticmethod
     @jax.jit
@@ -86,8 +29,6 @@ class FlipHorizontal(Augment):
         return video[:, :, :, ::-1]
 
     def _call(self, video: ndarray, *, key) -> ndarray:
-        if len(video.shape) > 4:
-            return jax.vmap(self._t)(video)
         return self._t(video)
 
     def update_strength(self, strength: float):
@@ -118,8 +59,6 @@ class Shear(Augment):
         return sheared.reshape(T, C, H, W)
 
     def _call(self, video: ndarray, *, key) -> ndarray:
-        if len(video.shape) > 4:
-            return jax.vmap(partial(self._t, factor=self.factor))(video)
         return self._t(video, factor=self.factor)
 
     def update_strength(self, strength: float):
@@ -149,8 +88,6 @@ class Rotate(Augment):
         return rotated.reshape(T, C, H, W)
 
     def _call(self, video: ndarray, *, key) -> ndarray:
-        if len(video.shape) > 4:
-            return jax.vmap(partial(self._t, angle=self.angle))(video)
         return self._t(video, self.angle)
 
     def update_strength(self, strength: float):
@@ -164,8 +101,6 @@ class Invert(Augment):
         return 255 - video
 
     def _call(self, video: ndarray, *, key) -> ndarray:
-        if len(video.shape) > 4:
-            return jax.vmap(self._t)(video)
         return self._t(video)
 
     def update_strength(self, strength: float):
@@ -213,9 +148,10 @@ class Normalize(Augment):
 
     @staticmethod
     @jax.jit
-    def _t(video: ndarray, mean: ndarray, std: ndarray, dtype: jnp.dtype):
-        video = video.astype(dtype)
-        return (video - mean) / std
+    def _t(video: ndarray, mean: ndarray, std: ndarray):
+        video = video.astype(mean.dtype)
+        video = video.transpose(0, 2, 3, 1)
+        return ((video - mean) / std).transpose(0, 3, 1, 2)
 
     def _call(self, video: ndarray, *, key=None) -> ndarray:
         return self._t(video, self.mean, self.std)

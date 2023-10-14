@@ -1,3 +1,4 @@
+import dataclasses
 from typing import Optional, Dict, Tuple
 
 import equinox as eqx
@@ -242,7 +243,11 @@ class LQViT(eqx.Module, Serialize):
         else:
             sd = load(path)
 
-        slf.vit_encoder.from_state_dict(sd, prefix='encoder')
+        slf = eqx.tree_at(
+            lambda x: x.vit_encoder,
+            slf,
+            slf.vit_encoder.from_state_dict(sd, 'encoder')
+        )
         if dtype is not None:
             slf = slf.astype(dtype)
         return slf
@@ -267,5 +272,14 @@ class LQViT(eqx.Module, Serialize):
         }
 
     def astype(self, dtype: jnp.dtype) -> 'LQViT':
-        cast_fn = lambda x: x.astype(dtype) if isinstance(x, jnp.ndarray) else x
-        return jax.tree_map(cast_fn, self)
+        def check(x) -> bool:
+            return (
+                eqx.is_array(x) or
+                isinstance(x, NamedArray) or
+                hasattr(x, 'astype')
+            ) and not isinstance(x, self.__class__)
+        return jax.tree_util.tree_map(
+            lambda x: x.astype(dtype) if check(x) else x,
+            self,
+            is_leaf=lambda x: check(x),
+        )

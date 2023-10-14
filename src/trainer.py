@@ -1,13 +1,13 @@
 from dataclasses import dataclass
 from functools import partial
-from typing import Tuple, Callable, Dict, List
+from typing import Tuple, Callable, Dict, List, Any
 
 import equinox as eqx
 import haliax as hax
 import jax
-import optax
+import jax.numpy as jnp
 import pypeln as pl
-from jax.numpy import ndarray, asarray
+from jax.numpy import ndarray
 from jax.sharding import Mesh
 from tqdm import tqdm
 
@@ -18,19 +18,20 @@ compute_axis_mapping = {"batch": "data"}
 param_axis_mapping = {"embed": "data"}
 
 
-def _calc_loss(model, x, y, loss_fn):
-    pred_y = model(x)
+def _calc_loss(model, x, y, loss_fn, *, key):
+    pred_y = model(x, key=key)
     return loss_fn(pred_y, y)
 
 
-def _calc_loss_partial(diff_model, static_model, x, y, loss_fn):
+def _calc_loss_partial(diff_model, static_model, x, y, loss_fn, *, key):
     model = eqx.combine(diff_model, static_model)
-    pred_y = model(x)
+    pred_y = model(x, key=key)
     return loss_fn(pred_y, y)
 
 
 @hax.named_jit
-def _init_optimizer(optimizer, model):
+def _init_optimizer(optimizer: Any, model: eqx.Module):
+    model = eqx.filter(model, eqx.is_array)
     opt_state = optimizer.init(model)
     return hax.shard_with_axis_mapping(opt_state, param_axis_mapping)
 
@@ -39,13 +40,9 @@ def _init_optimizer(optimizer, model):
 class TrainerConfig:
     max_epochs: int
     loss_fn: Callable
-    optim_cfg: Dict
-    optim: Callable
+    optim: Any
     metrics: Dict[str, Callable] = None
     distributed: bool = False
-
-    def make_optimizer(self):
-        return self.optim(**self.optim_cfg)
 
     def build_mesh(self):
         if self.distributed:
@@ -61,56 +58,58 @@ class TrainerConfig:
 
 
 class Trainer:
-    def __init__(self, config: TrainerConfig, model: LQViT, data: DataLoader):
+    def __init__(self, config: TrainerConfig, model: LQViT, data: DataLoader, *, key=None):
         self.config = config
         self.mesh = config.build_mesh()
-        self.model = model = hax.shard_with_axis_mapping(
+        self.model = hax.shard_with_axis_mapping(
             model,
             param_axis_mapping,
             self.mesh
         )
-        self.optim = config.make_optimizer()
+        self.optim = config.optim
         self.dl = data
         self.opt_state = None
 
         self.epoch = 0
+        self.key = key
 
     @staticmethod
     @hax.named_jit
-    def _data_put(x: Tuple[List[ndarray], ...]):
-        return tuple([
-            hax.shard_with_axis_mapping(
-                asarray(x_i),
-                compute_axis_mapping,
-            ) for x_i in x
-        ])
+    def _data_put(x: Tuple[List[ndarray], ...], mesh: Mesh):
+        cls, x = x
+        cls = hax.named(jnp.asarray(cls), 'cls')
+        x = hax.named(jnp.asarray(x), ('batch', 'temporal', 'channels', 'height', 'width'))
+        cls = hax.shard_with_axis_mapping(cls, compute_axis_mapping, mesh)
+        x = hax.shard_with_axis_mapping(x, compute_axis_mapping, mesh)
+        return cls, x
 
-    def get_loss_fn(self, x, y):
+    def get_loss_fn(self, x, y, *, key):
         fs = self.config.filter_spec(self.epoch)
         if fs is not None:
             diff_model, static_model = eqx.partition(self.model, fs)
             loss_fn = partial(
-                _calc_loss_partial,
+                eqx.filter_value_and_grad(_calc_loss_partial),
                 diff_model,
                 static_model,
                 x,
                 y,
-                self.config.loss_fn
+                self.config.loss_fn,
+                key=key
             )
         else:
             loss_fn = partial(
-                _calc_loss,
+                eqx.filter_value_and_grad(_calc_loss),
                 self.model,
                 x,
                 y,
-                self.config.loss_fn
+                self.config.loss_fn,
+                key=key
             )
         return loss_fn
 
     @staticmethod
     @hax.named_jit
-    def train_step(model, optim, opt_state, loss_fn):
-        calc_grad_loss = eqx.filter_value_and_grad(loss_fn)
+    def train_step(model, optim, opt_state, calc_grad_loss):
         with hax.axis_mapping(compute_axis_mapping):
             loss, grads = calc_grad_loss()
         updates, opt_state = optim.update(grads, opt_state, params=model)
@@ -124,18 +123,26 @@ class Trainer:
             return {k: m(model(x), y) for k, m in metrics.items()}
 
     def train_loop(self):
-        tl = self.dl.train_loader() | pl.thread.map(lambda _x: self._data_put(_x), workers=2, maxsize=4)
+        tl = (
+            self.dl.train_loader()
+                | pl.sync.map(partial(self._data_put, mesh=self.mesh))
+            )
         for cls, x in tqdm(tl, total=self.dl.len('train')):
+            print(x.dtype)
+            self.key, key_m = jax.random.split(self.key)
             loss, self.model, self.opt_state = self.train_step(
                 self.model,
                 self.optim,
                 self.opt_state,
-                self.get_loss_fn(x, cls)
+                self.get_loss_fn(x, cls, key=key_m)
             )
             tqdm.write(f'Loss: {loss}')
 
     def val_loop(self):
-        vl = self.dl.val_loader() | pl.thread.map(lambda _x: self._data_put(_x), workers=2, maxsize=4)
+        vl = (
+            self.dl.val_loader()
+                | pl.sync.map(partial(self._data_put, mesh=self.mesh))
+            )
         for cls, x in vl:
             loss = self.val_step(
                 self.model,
@@ -148,7 +155,7 @@ class Trainer:
 
     def train(self):
         with self.mesh:
-            self.opt_state = self._init_optimizer(self.optim, self.model)
+            self.opt_state = _init_optimizer(self.optim, self.model)
             while self.epoch < self.config.max_epochs:
                 self.train_loop()
                 self.val_loop()
