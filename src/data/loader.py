@@ -4,6 +4,8 @@ from typing import Any, Iterable, Callable, Optional, Dict, List, Tuple
 
 import jax
 import pypeln as pl
+import torch
+from lightning import LightningDataModule
 from rand_archive import Reader
 
 import src.data.transforms as T
@@ -22,20 +24,23 @@ def default_transforms(key):
 @dataclass(init=True, repr=True, frozen=True)
 class DLConfig:
     data_loc: str
+    collate_fn: Callable
     batch_size: int = 1
     shuffle: bool = False
     n_frames: int = 32
-    base_seed: int = 42
+    shard: Optional[Tuple[int, int]] = None
 
 
-class DataLoader:
-    def __init__(self, dataset: str, config: DLConfig):
+class DataLoader(LightningDataModule):
+    def __init__(self, dataset: str, config: DLConfig, *, key):
+        super().__init__()
         self.dataset = dataset
         self.config = config
+        self.key, key_t = jax.random.split(key)
 
-        self.readers = {stage: self._build_reader(stage) for stage in ['train', 'val', 'test']}
-        self.transforms: Dict[str, Optional[List[Callable]]] = default_transforms(jax.random.PRNGKey(config.base_seed))
-        self.epoch = 0
+        self._len: Dict[str, int] = {}
+        self.readers: Dict[str, Reader] = {}
+        self.transforms: Dict[str, List[Callable]] = {}
 
     def _build_reader(self, stage) -> Iterable[Any]:
         reader = Reader().by_count(64)
@@ -45,63 +50,75 @@ class DataLoader:
         else:
             reader = reader.open_file(f'{self.config.data_loc}/{self.dataset}/{stage}.raa')
 
-        return reader
+        if self.config.shard is not None and stage != 'test':
+            reader = reader.with_sharding(*self.config.shard)
 
-    def _update_transforms(self):
-        pass
+        return reader
 
     def _get_loader(self, stage) -> Iterable[Any]:
         loader = self.readers[stage]
         if stage == 'train' and self.config.shuffle:
-            loader = loader.with_shuffling(self._epoch_seed())
+            loader = loader.with_shuffling(self._fork_seed())
 
         def to_tensors(x: Tuple[str, bytes]):
             return VideoSample(**pickle.loads(x[1])).sample_frames(self.config.n_frames).to_tensors()
         loader = (
-            pl.sync.from_iterable(iter(loader))
+            iter(loader)
             | pl.thread.map(to_tensors, workers=12, maxsize=32)
         )
 
-        if self.transforms[stage] is not None:
-            def do_transform(transforms, x):
-                for transform in transforms:
+        if stage in self.transforms:
+            def do_transform(x):
+                cls, x = x
+                for transform in self.transforms[stage]:
                     x = transform(x)
-                return x
-            loader = loader | pl.sync.map(lambda x: do_transform(self.transforms[stage], x))
+                return cls, x
+            loader = loader | pl.sync.map(do_transform)
 
         if self.config.batch_size > 1:
-            loader = pl.sync.from_iterable(Batcher(loader, 2, self.config.batch_size))
+            loader = Batcher(loader, 2, self.config.batch_size)
 
         return loader
 
-    def _epoch_seed(self) -> int:
-        return self.config.base_seed + self.epoch
+    def _fork_seed(self) -> int:
+        self.key, key = jax.random.split(self.key)
+        return int(key[0])
 
-    def step(self):
-        self.epoch += 1
-        self._update_transforms()
+    def setup(self, stage: str) -> None:
+        if len(self.transforms) == 0:
+            self.transforms = default_transforms(self.key)
+        if len(self.readers) == 0:
+            self.readers = {stage: self._build_reader(stage) for stage in ['train', 'val', 'test']}
+
+    def transfer_batch_to_device(self, batch: Any, device: torch.device, dataloader_idx: int) -> Any:
+        return self.config.collate_fn(batch)
 
     def train_loader(self) -> Iterable[Any]:
-        return self._get_loader('train')
+        dl = self._get_loader('train')
+        if 'train' in self._len:
+            dl.__len__ = lambda: self._len['train']
+        return dl
 
     def val_loader(self) -> Iterable[Any]:
-        return self._get_loader('val')
+        dl = self._get_loader('val')
+        if 'val' in self._len:
+            dl.__len__ = lambda: self._len['val']
+        return dl
 
-    def test_loader(self) -> Iterable[Any]:
-        return self._get_loader('test')
+    def state_dict(self) -> Dict[str, Any]:
+        return {
+            'key': self.key,
+        }
 
-    def len(self, stage: str) -> int:
-        raise NotImplementedError
+    def load_state_dict(self, state_dict: Dict[str, Any]):
+        self.key = state_dict['key']
 
 
 class SSV2(DataLoader):
-    def __init__(self, config: DLConfig):
-        super().__init__('ssv2', config)
+    def __init__(self, config: DLConfig, *, key):
+        super().__init__('ssv2', config, key=key)
         self._len = {
             'train': 220_847,
             'val': 24_777,
             'test': 27_157
         }
-
-    def len(self, stage: str) -> int:
-        return self._len[stage]

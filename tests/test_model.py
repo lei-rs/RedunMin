@@ -48,6 +48,7 @@ class TestLQViT(TestCase):
             'gs://redunmin-us/vit/vit-base-16-224.safetensors',
             cfg,
             key=key,
+            dtype=jnp.bfloat16,
         )
         model = model.astype(jnp.bfloat16)
         x = hax.ones((Batch, Temporal, cfg.Channels, cfg.Height, cfg.Width), dtype=jnp.bfloat16)

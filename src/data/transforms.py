@@ -1,6 +1,6 @@
 import random
 from functools import partial
-from typing import Tuple, Union, List, Literal
+from typing import List, Literal
 
 import jax
 import jax.numpy as jnp
@@ -9,14 +9,8 @@ from jax.scipy.ndimage import map_coordinates
 
 
 class Augment:
-    def _call(self, video: ndarray, *, key) -> ndarray:
+    def __call__(self, video: ndarray, *, key) -> ndarray:
         raise NotImplementedError
-
-    def __call__(self, video: Union[ndarray, Tuple[ndarray, ...]], *, key=None) -> Union[ndarray, Tuple[ndarray, ...]]:
-        if isinstance(video, tuple):
-            vid = self._call(video[-1], key=key)
-            return *video[:-1], vid
-        return self._call(video, key=key)
 
     def update_strength(self, strength: float):
         raise NotImplementedError
@@ -28,7 +22,7 @@ class FlipHorizontal(Augment):
     def _t(video: ndarray):
         return video[:, :, :, ::-1]
 
-    def _call(self, video: ndarray, *, key) -> ndarray:
+    def __call__(self, video: ndarray, *, key) -> ndarray:
         return self._t(video)
 
     def update_strength(self, strength: float):
@@ -58,7 +52,7 @@ class Shear(Augment):
         sheared = jax.vmap(func)(video_reshaped)
         return sheared.reshape(T, C, H, W)
 
-    def _call(self, video: ndarray, *, key) -> ndarray:
+    def __call__(self, video: ndarray, *, key) -> ndarray:
         return self._t(video, factor=self.factor)
 
     def update_strength(self, strength: float):
@@ -87,7 +81,7 @@ class Rotate(Augment):
         rotated = jax.vmap(func)(video_reshaped)
         return rotated.reshape(T, C, H, W)
 
-    def _call(self, video: ndarray, *, key) -> ndarray:
+    def __call__(self, video: ndarray, *, key) -> ndarray:
         return self._t(video, self.angle)
 
     def update_strength(self, strength: float):
@@ -100,7 +94,7 @@ class Invert(Augment):
     def _t(video: ndarray):
         return 255 - video
 
-    def _call(self, video: ndarray, *, key) -> ndarray:
+    def __call__(self, video: ndarray, *, key) -> ndarray:
         return self._t(video)
 
     def update_strength(self, strength: float):

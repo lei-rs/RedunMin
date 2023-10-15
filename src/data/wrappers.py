@@ -1,8 +1,9 @@
+import jax
 from typing import Iterable, Any
 
 
 class Batcher:
-    def __init__(self, inner: Iterable[Any], n_items: int, batch_size: int):
+    def __init__(self, inner: Iterable, n_items: int, batch_size: int):
         self.inner = inner
         self.n_items = n_items
         self.batch_size = batch_size
@@ -24,3 +25,18 @@ class Batcher:
     def reset(self):
         self.buffer = [0] * self.batch_size
         self.buffer_idx = 0
+
+
+class Stopper:
+    def __init__(self, inner: Iterable):
+        self.inner = inner
+
+    def __iter__(self):
+        for item in self.inner:
+            stop_signal = jax.device_put(0)
+            summed = jax.pmap(lambda x: jax.lax.psum(x, 'i'), 'i')(stop_signal)
+            if jax.block_until_ready(summed) > 0:
+                return
+            yield item
+        stop_signal = jax.device_put(1)
+        _ = jax.pmap(lambda x: jax.lax.psum(x, 'i'), 'i')(stop_signal)

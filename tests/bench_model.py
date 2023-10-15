@@ -43,23 +43,25 @@ def test_bench_baseline_encoder_ddp(benchmark):
     fwd = jax.jit(model.apply)
     forward = lambda: jax.block_until_ready(fwd(params, x))
     forward()
+    jax.profiler.start_trace('tmp/', create_perfetto_trace=True)
     benchmark(forward)
+    jax.profiler.stop_trace()
 
 
 def test_bench_encoder_ddp(benchmark):
-    mesh = mesh_utils.create_device_mesh((4, 2), jax.devices('tpu'), contiguous_submeshes=True)
-    mesh = Mesh(mesh, ('data', 'model'))
+    mesh = Mesh(jax.devices('tpu'), 'data')
     compute_axis_mapping = {'batch': 'data'}
-    param_axis_mapping = {'embed': 'model'}
 
     with mesh:
         key = jrand.PRNGKey(1)
         x = hax.ones((Batch, Pos, Embed), dtype=jnp.bfloat16)
         x = hax.shard_with_axis_mapping(x, compute_axis_mapping)
-        model = make_model(param_axis_mapping)
+        model = make_model({})
         fwd = lambda: jax.block_until_ready(forward(model, x, key=key, mapping=compute_axis_mapping))
         fwd()
+        jax.profiler.start_trace('tmp/', create_perfetto_trace=True)
         benchmark(fwd)
+        jax.profiler.stop_trace()
 
 
 def test_bench_encoder_fsdp(benchmark):
@@ -74,4 +76,6 @@ def test_bench_encoder_fsdp(benchmark):
         model = make_model(param_axis_mapping)
         fwd = lambda: jax.block_until_ready(forward(model, x, key=key, mapping=compute_axis_mapping))
         fwd()
+        jax.profiler.start_trace('tmp/', create_perfetto_trace=True)
         benchmark(fwd)
+        jax.profiler.stop_trace()
