@@ -1,24 +1,35 @@
+import equinox as eqx
 import haliax as hax
 import jax
 import jax.numpy as jnp
 import jax.random as jrand
-from jax.experimental import mesh_utils
+import optax
+from haliax import NamedArray
+from jax.nn import one_hot
 from jax.sharding import Mesh, PartitionSpec, NamedSharding
 from transformers import ViTConfig as HFViTConfig
 from transformers.models.vit.modeling_flax_vit import FlaxViTEncoder
 
 from src.model.lq import LQViT, LQViTConfig
 
-Batch = hax.Axis(name='batch', size=64)
+Batch = hax.Axis(name='batch', size=32)
 Pos = hax.Axis(name='position', size=196 * 8)
 Embed = hax.Axis(name='embed', size=768)
+
+
+def cross_entropy(logits: NamedArray, labels: NamedArray, num_classes: int) -> NamedArray:
+    labels = labels.astype(jnp.int32)
+    return optax.softmax_cross_entropy(
+        logits.array,
+        one_hot(labels.array, num_classes)
+    ).mean()
 
 
 @hax.named_jit
 def make_model(mapping):
     key = jrand.PRNGKey(0)
     cfg = LQViTConfig()
-    model = LQViT.init(cfg, key=key).astype(jnp.bfloat16).vit_encoder
+    model = LQViT.init(cfg, key=key).astype(jnp.bfloat16)
     return hax.shard_with_axis_mapping(model, mapping)
 
 
@@ -26,6 +37,17 @@ def make_model(mapping):
 def forward(model, x, key, mapping):
     with hax.axis_mapping(mapping):
         return model(x, key=key)
+
+
+@hax.named_jit
+@eqx.filter_value_and_grad
+def grad_forward(model, x, key, mapping):
+    y_pred = forward(model, x, key, mapping)
+    return cross_entropy(
+        y_pred,
+        hax.named(jnp.zeros(Batch.size, jnp.int32), 'batch'),
+        400
+    )
 
 
 def test_bench_baseline_encoder_ddp(benchmark):
@@ -49,14 +71,14 @@ def test_bench_baseline_encoder_ddp(benchmark):
 
 
 def test_bench_encoder_ddp(benchmark):
-    mesh = Mesh(jax.devices('tpu'), 'data')
+    mesh = Mesh(jax.devices('tpu'), ('data', 'model'))
     compute_axis_mapping = {'batch': 'data'}
 
     with mesh:
         key = jrand.PRNGKey(1)
         x = hax.ones((Batch, Pos, Embed), dtype=jnp.bfloat16)
         x = hax.shard_with_axis_mapping(x, compute_axis_mapping)
-        model = make_model({})
+        model = make_model({}).vit_encoder
         fwd = lambda: jax.block_until_ready(forward(model, x, key=key, mapping=compute_axis_mapping))
         fwd()
         jax.profiler.start_trace('tmp/', create_perfetto_trace=True)
@@ -73,8 +95,48 @@ def test_bench_encoder_fsdp(benchmark):
         key = jrand.PRNGKey(1)
         x = hax.ones((Batch, Pos, Embed), dtype=jnp.bfloat16)
         x = hax.shard_with_axis_mapping(x, compute_axis_mapping)
+        model = make_model(param_axis_mapping).vit_encoder
+        fwd = lambda: jax.block_until_ready(forward(model, x, key=key, mapping=compute_axis_mapping))
+        fwd()
+        jax.profiler.start_trace('tmp/', create_perfetto_trace=True)
+        benchmark(fwd)
+        jax.profiler.stop_trace()
+
+
+def test_bench_model_fsdp(benchmark):
+    mesh = Mesh(jax.devices('tpu'), 'data')
+    compute_axis_mapping = {'batch': 'data'}
+    param_axis_mapping = {'embed': 'data'}
+
+    with mesh:
+        key = jrand.PRNGKey(1)
+        x = hax.named(
+            jnp.ones((32, 32, 3, 224, 224), dtype=jnp.bfloat16),
+            ('batch', 'temporal', 'channels', 'height', 'width')
+        )
+        x = hax.shard_with_axis_mapping(x, compute_axis_mapping)
         model = make_model(param_axis_mapping)
         fwd = lambda: jax.block_until_ready(forward(model, x, key=key, mapping=compute_axis_mapping))
+        fwd()
+        jax.profiler.start_trace('tmp/', create_perfetto_trace=True)
+        benchmark(fwd)
+        jax.profiler.stop_trace()
+
+
+def test_bench_model_fsdp_grad(benchmark):
+    mesh = Mesh(jax.devices('tpu'), 'data')
+    compute_axis_mapping = {'batch': 'data'}
+    param_axis_mapping = {'embed': 'data'}
+
+    with mesh:
+        key = jrand.PRNGKey(1)
+        x = hax.named(
+            jnp.ones((32, 32, 3, 224, 224), dtype=jnp.bfloat16),
+            ('batch', 'temporal', 'channels', 'height', 'width')
+        )
+        x = hax.shard_with_axis_mapping(x, compute_axis_mapping)
+        model = make_model(param_axis_mapping)
+        fwd = lambda: jax.block_until_ready(grad_forward(model, x, key=key, mapping=compute_axis_mapping))
         fwd()
         jax.profiler.start_trace('tmp/', create_perfetto_trace=True)
         benchmark(fwd)

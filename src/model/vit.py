@@ -74,7 +74,7 @@ class ViTConfig:
         return self.image_size ** 2 // self.patch_size ** 2
 
 
-class ViTMLP(eqx.Module, Serialize):
+class ViTMLP(Serialize, eqx.Module):
     to_hidden: hnn.Linear
     from_hidden: hnn.Linear
 
@@ -82,7 +82,7 @@ class ViTMLP(eqx.Module, Serialize):
 
     act: Callable = eqx.static_field(default=hnn.gelu)
     dropout: Optional[hnn.Dropout] = eqx.static_field(default=None)
-    inference: bool = eqx.static_field(default=False)
+    inference: bool = eqx.field(default=False)
 
     @staticmethod
     def init(
@@ -121,8 +121,12 @@ class ViTMLP(eqx.Module, Serialize):
         x = self.from_hidden(x)
         return x
 
-    def set_inference(self, inference: bool):
-        self.inference = inference
+    def set_inference(self, inference: bool) -> 'ViTMLP':
+        return eqx.tree_at(
+            lambda x: x.inference,
+            self,
+            inference
+        )
 
     def _state_dict_key_map(self) -> Optional[Dict[str, Optional[str]]]:
         return {
@@ -173,7 +177,7 @@ class ViTMLP(eqx.Module, Serialize):
         return state_dict
 
 
-class ViTAttention(eqx.Module, Serialize):
+class ViTAttention(Serialize, eqx.Module):
     config: ViTConfig = eqx.static_field()
     q_proj: hnn.Linear
     k_proj: hnn.Linear
@@ -298,7 +302,7 @@ class ViTAttention(eqx.Module, Serialize):
         return state_dict
 
 
-class VitEncoderLayer(eqx.Module, Serialize):
+class VitEncoderLayer(Serialize, eqx.Module):
     config: ViTConfig = eqx.static_field()
     attention: ViTAttention
     mlp: ViTMLP
@@ -340,7 +344,7 @@ class VitEncoderLayer(eqx.Module, Serialize):
         }
 
 
-class ViTEncoder(eqx.Module, Serialize):
+class ViTEncoder(Serialize, eqx.Module):
     config: ViTConfig = eqx.static_field()
     layers: Stacked[VitEncoderLayer]
 

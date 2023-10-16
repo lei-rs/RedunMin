@@ -3,6 +3,7 @@ from io import BytesIO
 from typing import List, Optional, Any, Union, Tuple
 
 import av
+import jax
 import jax.numpy as jnp
 import numpy as np
 from av.video.frame import VideoFrame
@@ -117,6 +118,7 @@ class VideoSample(BaseModel):
 
     def to_tensors(self) -> Tuple[jnp.ndarray, jnp.ndarray]:
         cls, vid = self.to_arrays()
-        cls = jnp.asarray(cls)
-        vid = jnp.asarray(vid)
+        with jax.default_device(jax.devices("cpu")[0]):
+            cls = jnp.asarray(cls)
+            vid = jnp.asarray(vid)
         return cls, vid

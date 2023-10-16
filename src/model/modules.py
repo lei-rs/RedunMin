@@ -17,8 +17,7 @@ class FeedForward(eqx.Module, Serialize):
 
     act: Callable = eqx.static_field(default=hnn.gelu)
     dropout: Optional[hnn.Dropout] = eqx.static_field(default=None)
-    inference: bool = eqx.static_field(default=False)
-    sd_key_map: Optional[Dict[str, str]] = eqx.static_field(default=None)
+    inference: bool = eqx.field(default=False)
 
     @staticmethod
     def init(
@@ -30,7 +29,6 @@ class FeedForward(eqx.Module, Serialize):
             use_bias: bool = False,
             dropout: float = 0.1,
             out_first: bool = False,
-            sd_key_map=None,
     ) -> 'FeedForward':
         k_to_embed, k_from_embed = jax_rand.split(key)
 
@@ -48,7 +46,6 @@ class FeedForward(eqx.Module, Serialize):
             Hidden=Hidden,
             dropout=dropout,
             inference=False,
-            sd_key_map=sd_key_map,
         )
 
     @named_call
@@ -62,7 +59,11 @@ class FeedForward(eqx.Module, Serialize):
         return x
 
     def set_inference(self, inference: bool):
-        self.inference = inference
+        return eqx.tree_at(
+            lambda x: x.inference,
+            self,
+            inference
+        )
 
 
 class Attention(eqx.Module, Serialize):

@@ -1,5 +1,5 @@
 import dataclasses
-from typing import Optional, Dict, Tuple
+from typing import Optional, Dict, Tuple, Any
 
 import equinox as eqx
 import haliax as hax
@@ -8,6 +8,7 @@ import jax
 import jax.numpy as jnp
 import jax.random as jax_rand
 import jax_dataclasses as jdc
+import jax.tree_util as jtu
 from google.cloud import storage
 from haliax import NamedArray, Axis
 from haliax.jax_utils import named_call
@@ -191,7 +192,7 @@ class GAPCls(eqx.Module):
         return self.linear(x)
 
 
-class LQViT(eqx.Module, Serialize):
+class LQViT(Serialize, eqx.Module):
     config: LQViTConfig
 
     patch_embed: PatchEmbeddings
@@ -274,11 +275,10 @@ class LQViT(eqx.Module, Serialize):
     def astype(self, dtype: jnp.dtype) -> 'LQViT':
         def check(x) -> bool:
             return (
-                    eqx.is_array(x) or
-                    isinstance(x, NamedArray) or
-                    hasattr(x, 'astype')
+                eqx.is_array(x) or
+                isinstance(x, NamedArray) or
+                hasattr(x, 'astype')
             ) and not isinstance(x, self.__class__)
-
         return jax.tree_util.tree_map(
             lambda x: x.astype(dtype) if check(x) else x,
             self,

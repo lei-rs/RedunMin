@@ -1,56 +1,51 @@
 from functools import partial
-from typing import List, Tuple
+from typing import Tuple
 
 import haliax as hax
 import jax
 import jax.numpy as jnp
 import jax.random as jax_rand
 import optax
-from lightning import Trainer
 from haliax import NamedArray
-from jax import Array
+from jax.nn import one_hot
 from jax.numpy import bfloat16
 from jax.sharding import Mesh
-from jax.nn import one_hot
+from jax_smi import initialise_tracking
+from lightning import Trainer
 
+import src.trainer as trainer
 from src.data.loader import DLConfig, SSV2
 from src.model.lq import LQViTConfig, LQViT
 from src.trainer import TrainConfig, TrainModule
 
-
-Batch = hax.Axis(name='batch', size=16)
-
-compute_axis_mapping = {"batch": "data"}
+Batch = hax.Axis(name='batch', size=32)
+compute_axis_mapping = {'batch': 'data'}
+param_axis_mapping = {'embed': 'data'}
 global_mesh = Mesh(jax.devices('tpu'), 'data')
 local_mesh = Mesh(jax.local_devices(backend='tpu'), 'data')
 
 
-def collate_and_put(x: Tuple[List[Array], List[Array]]) -> Tuple[NamedArray, NamedArray]:
-    cls, x = x
-    cls = hax.named(jnp.asarray(cls), 'cls')
-    x = hax.named(jnp.asarray(x), ('batch', 'temporal', 'channels', 'height', 'width'))
-    cls = hax.shard_with_axis_mapping(cls, compute_axis_mapping, local_mesh)
-    x = hax.shard_with_axis_mapping(x, compute_axis_mapping, local_mesh)
-    return cls, x
+def put(x: Tuple[NamedArray, NamedArray]) -> Tuple[NamedArray, NamedArray]:
+    with local_mesh:
+        return hax.shard_with_axis_mapping(x, compute_axis_mapping)
 
 
-def cross_entropy(logits: NamedArray, labels: NamedArray, num_classes: int):
+def cross_entropy(logits: NamedArray, labels: NamedArray, num_classes: int) -> NamedArray:
     labels = labels.astype(jnp.int32)
-    return jnp.mean(
-        optax.softmax_cross_entropy(
-            logits.array,
-            one_hot(labels.array, num_classes)
-        )
-    )
+    return optax.softmax_cross_entropy(
+        logits.array,
+        one_hot(labels.array, num_classes)
+    ).mean()
 
 
 if __name__ == '__main__':
+    trainer.DEBUG = True
     key = jax_rand.PRNGKey(0)
     key, key_dl, key_model, key_trainer = jax_rand.split(key, 4)
 
     dl_cfg = DLConfig(
         data_loc='gs://redunmin-us',
-        collate_fn=collate_and_put,
+        put_fn=put,
         batch_size=Batch.size,
         shuffle=True,
         n_frames=32,
@@ -67,13 +62,19 @@ if __name__ == '__main__':
     )
 
     train_cfg = TrainConfig(
+        batch_size=Batch.size,
         loss_fn=partial(cross_entropy, num_classes=model_cfg.n_classes),
+        global_mesh=global_mesh,
+        compute_axis_mapping=compute_axis_mapping,
+        param_axis_mapping=param_axis_mapping,
         optim=optax.adamw(
             1e-4,
             weight_decay=1e-2,
         ),
     )
-
-    tm = TrainModule(train_cfg, model, key=key_trainer)
+    tm = TrainModule(model, train_cfg, key=key_trainer)
     trainer = Trainer(max_epochs=100)
+    initialise_tracking()
+    jax.profiler.start_trace('.tmp/', create_perfetto_trace=True)
     trainer.fit(tm, datamodule=dl)
+    jax.profiler.stop_trace()

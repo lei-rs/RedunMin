@@ -147,7 +147,7 @@ class Normalize(Augment):
         video = video.transpose(0, 2, 3, 1)
         return ((video - mean) / std).transpose(0, 3, 1, 2)
 
-    def _call(self, video: ndarray, *, key=None) -> ndarray:
+    def __call__(self, video: ndarray, *, key=None) -> ndarray:
         return self._t(video, self.mean, self.std)
 
     @classmethod
