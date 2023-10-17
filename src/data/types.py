@@ -119,6 +119,12 @@ class VideoSample(BaseModel):
     def to_tensors(self) -> Tuple[jnp.ndarray, jnp.ndarray]:
         cls, vid = self.to_arrays()
         with jax.default_device(jax.devices("cpu")[0]):
-            cls = jnp.asarray(cls)
-            vid = jnp.asarray(vid)
-        return cls, vid
+            ret = _to_tensor(cls, vid)
+        return ret
+
+
+@jax.jit
+def _to_tensor(cls, vid):
+    cls = jnp.asarray(cls)
+    vid = jnp.asarray(vid)
+    return cls, vid

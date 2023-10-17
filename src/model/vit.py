@@ -9,7 +9,7 @@ from haliax.jax_utils import named_call, shaped_rng_split
 from haliax.nn.scan import Stacked
 from transformers.models.vit import ViTConfig as HFViTConfig
 
-from .levanter.safetensor import (
+from .levanter.serialize import (
     StateDict,
     Serialize,
     apply_prefix,

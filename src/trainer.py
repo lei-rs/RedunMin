@@ -1,5 +1,5 @@
 from dataclasses import dataclass
-from functools import cached_property
+from functools import cached_property, wraps
 from typing import Any, Dict, Callable
 
 import equinox as eqx
@@ -12,7 +12,6 @@ from lightning import LightningModule
 from optax import GradientTransformation
 
 from src.model.lq import LQViT
-
 
 DEBUG = False
 
@@ -29,12 +28,13 @@ class TrainConfig:
 
 
 class TrainModule(LightningModule):
-    def __init__(self, model: LQViT, cfg: TrainConfig, *, key):
+    def __init__(self, model_init: Callable[[], LQViT], cfg: TrainConfig, *, key):
         super().__init__()
-        self.model = model
+        self.model_init = model_init
         self.cfg = cfg
         self.key = key
 
+        self.model = None
         self.opt_state = None
 
         self.automatic_optimization = False
@@ -44,24 +44,34 @@ class TrainModule(LightningModule):
     def global_step(self) -> int:
         return self.global_step_
 
-    @cached_property
-    def filter_spec(self):
-        fs = jtu.tree_map(lambda _: True, self.model)
-        return eqx.tree_at(
+    @staticmethod
+    def filter_spec(model):
+        fs = jtu.tree_map(lambda _: False, model)
+        '''return eqx.tree_at(
             lambda x: x.vit_encoder,
             fs,
-            jtu.tree_map(lambda _: False, self.model.vit_encoder)
-        )
+            jtu.tree_map(lambda _: False, model.vit_encoder)
+        )'''
+        return fs
+
+    @cached_property
+    def loss_fn(self):
+        def _loss(model, *batch, **batch_kwargs):
+            with hax.axis_mapping(self.cfg.compute_axis_mapping):
+                return self.cfg.loss_fn(model, *batch, **batch_kwargs)
+        return named_jit(_loss, in_axis_resources=self.cfg.param_axis_mapping)
 
     @cached_property
     def _forward_fn(self):
         @eqx.filter_value_and_grad
-        def _forward(diff_model, static_model, loss_fn, target, x, *, key):
-            with hax.axis_mapping(self.cfg.compute_axis_mapping):
-                model = eqx.combine(diff_model, static_model)
-                y_pred = model(x, key=key)
-                return loss_fn(y_pred, target)
-        return _forward
+        def _forward(diff_model, static_model, *batch, **batch_kwargs):
+            model = eqx.combine(diff_model, static_model)
+            return self.loss_fn(model, *batch, **batch_kwargs)
+        return named_jit(
+            _forward,
+            out_axis_resources=self.cfg.param_axis_mapping,
+            donate_args=(True, True)
+        )
 
     @cached_property
     def _backward_fn(self):
@@ -74,11 +84,11 @@ class TrainModule(LightningModule):
     @cached_property
     def _train_step_fn(self):
         def train_step(model, opt_state, *batch, **batch_kwargs):
-            diff_model, static_model = eqx.partition(model, self.filter_spec)
+            fs = self.filter_spec(model)
+            diff_model, static_model = eqx.partition(model, fs)
             loss, grads = self._forward_fn(
                 diff_model,
                 static_model,
-                self.cfg.loss_fn,
                 *batch,
                 **batch_kwargs,
             )
@@ -89,7 +99,11 @@ class TrainModule(LightningModule):
                 diff_model
             )
             return loss, model, opt_state
-        return named_jit(train_step, donate_args=(True, True))
+        return named_jit(
+            train_step,
+            out_axis_resources=self.cfg.param_axis_mapping,
+            donate_args=(True, True)
+        )
 
     @cached_property
     def _val_step_fn(self):
@@ -109,12 +123,13 @@ class TrainModule(LightningModule):
         self.key, key = jax.random.split(self.key)
 
         with self.cfg.global_mesh:
-            loss, self.model, self.opt_state = self._train_step_fn(
+            '''loss, self.model, self.opt_state = self._train_step_fn(
                 self.model,
                 self.opt_state,
                 *batch,
                 key=key,
-            )
+            )'''
+            loss = self.loss_fn(self.model, *batch, key=key)
 
         loss = float(jax.block_until_ready(loss))
         self.log(
@@ -144,12 +159,17 @@ class TrainModule(LightningModule):
         return metrics['val_loss']'''
 
     def configure_optimizers(self):
-        @named_jit(out_axis_resources=self.cfg.param_axis_mapping)
-        def _init_model_optim():
-            trainable, _ = eqx.partition(self.model, self.filter_spec)
+        def _init_model_optim(model):
+            fs = self.filter_spec(model)
+            trainable, _ = eqx.partition(model, fs)
             trainable = eqx.filter(trainable, eqx.is_inexact_array)
-            return self.model, self.cfg.optim.init(trainable)
-        with self.cfg.global_mesh:
-            self.model, self.opt_state = _init_model_optim()
+            return model, self.cfg.optim.init(trainable)
+        with (self.cfg.global_mesh):
+            self.model, self.opt_state = named_jit(
+                _init_model_optim,
+                self.cfg.param_axis_mapping,
+                out_axis_resources=self.cfg.param_axis_mapping,
+                donate_args=True,
+            )(self.model_init())
         if DEBUG:
             print(jax.debug.visualize_array_sharding(self.model.pos_embed.array[0]))

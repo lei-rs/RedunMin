@@ -7,6 +7,7 @@ import optax
 from haliax import NamedArray
 from jax.nn import one_hot
 from jax.sharding import Mesh, PartitionSpec, NamedSharding
+from jax_smi import initialise_tracking
 from transformers import ViTConfig as HFViTConfig
 from transformers.models.vit.modeling_flax_vit import FlaxViTEncoder
 
@@ -15,6 +16,9 @@ from src.model.lq import LQViT, LQViTConfig
 Batch = hax.Axis(name='batch', size=32)
 Pos = hax.Axis(name='position', size=196 * 8)
 Embed = hax.Axis(name='embed', size=768)
+
+
+initialise_tracking()
 
 
 def cross_entropy(logits: NamedArray, labels: NamedArray, num_classes: int) -> NamedArray:
@@ -65,9 +69,7 @@ def test_bench_baseline_encoder_ddp(benchmark):
     fwd = jax.jit(model.apply)
     forward = lambda: jax.block_until_ready(fwd(params, x))
     forward()
-    jax.profiler.start_trace('tmp/', create_perfetto_trace=True)
     benchmark(forward)
-    jax.profiler.stop_trace()
 
 
 def test_bench_encoder_ddp(benchmark):
@@ -81,9 +83,7 @@ def test_bench_encoder_ddp(benchmark):
         model = make_model({}).vit_encoder
         fwd = lambda: jax.block_until_ready(forward(model, x, key=key, mapping=compute_axis_mapping))
         fwd()
-        jax.profiler.start_trace('tmp/', create_perfetto_trace=True)
         benchmark(fwd)
-        jax.profiler.stop_trace()
 
 
 def test_bench_encoder_fsdp(benchmark):
@@ -98,9 +98,7 @@ def test_bench_encoder_fsdp(benchmark):
         model = make_model(param_axis_mapping).vit_encoder
         fwd = lambda: jax.block_until_ready(forward(model, x, key=key, mapping=compute_axis_mapping))
         fwd()
-        jax.profiler.start_trace('tmp/', create_perfetto_trace=True)
         benchmark(fwd)
-        jax.profiler.stop_trace()
 
 
 def test_bench_model_fsdp(benchmark):
@@ -118,9 +116,7 @@ def test_bench_model_fsdp(benchmark):
         model = make_model(param_axis_mapping)
         fwd = lambda: jax.block_until_ready(forward(model, x, key=key, mapping=compute_axis_mapping))
         fwd()
-        jax.profiler.start_trace('tmp/', create_perfetto_trace=True)
         benchmark(fwd)
-        jax.profiler.stop_trace()
 
 
 def test_bench_model_fsdp_grad(benchmark):
@@ -138,6 +134,4 @@ def test_bench_model_fsdp_grad(benchmark):
         model = make_model(param_axis_mapping)
         fwd = lambda: jax.block_until_ready(grad_forward(model, x, key=key, mapping=compute_axis_mapping))
         fwd()
-        jax.profiler.start_trace('tmp/', create_perfetto_trace=True)
         benchmark(fwd)
-        jax.profiler.stop_trace()

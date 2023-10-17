@@ -18,24 +18,39 @@ from src.data.loader import DLConfig, SSV2
 from src.model.lq import LQViTConfig, LQViT
 from src.trainer import TrainConfig, TrainModule
 
-Batch = hax.Axis(name='batch', size=32)
+Batch = hax.Axis(name='batch', size=64)
 compute_axis_mapping = {'batch': 'data'}
 param_axis_mapping = {'embed': 'data'}
 global_mesh = Mesh(jax.devices('tpu'), 'data')
-local_mesh = Mesh(jax.local_devices(backend='tpu'), 'data')
 
 
-def put(x: Tuple[NamedArray, NamedArray]) -> Tuple[NamedArray, NamedArray]:
-    with local_mesh:
-        return hax.shard_with_axis_mapping(x, compute_axis_mapping)
+def put(x: Tuple[NamedArray, NamedArray]) -> tuple[NamedArray, NamedArray]:
+    x1, x2 = x
+    '''with global_mesh:
+        return (
+            hax.shard_with_axis_mapping(x1, compute_axis_mapping),
+            hax.shard_with_axis_mapping(x2, compute_axis_mapping),
+        )'''
+    return jax.device_put(x1), jax.device_put(x2)
 
 
-def cross_entropy(logits: NamedArray, labels: NamedArray, num_classes: int) -> NamedArray:
-    labels = labels.astype(jnp.int32)
+def cross_entropy(model: LQViT, targets: NamedArray, x: NamedArray, *, key, num_classes: int) -> NamedArray:
+    raw_logits = model(x, key=key)
+    targets = targets.astype(jnp.int32)
     return optax.softmax_cross_entropy(
-        logits.array,
-        one_hot(labels.array, num_classes)
+        raw_logits.array,
+        one_hot(targets.array, num_classes)
     ).mean()
+
+
+def init_model(*args, **kwargs):
+    model = LQViT.from_pretrained(
+        'google/vit-base-patch16-224',
+        f'{dl_cfg.data_loc}/vit/vit-base-16-224.safetensors',
+        *args,
+        **kwargs,
+    )
+    return hax.shard_with_axis_mapping(model, param_axis_mapping)
 
 
 if __name__ == '__main__':
@@ -53,13 +68,7 @@ if __name__ == '__main__':
     dl = SSV2(dl_cfg, key=key_dl)
 
     model_cfg = LQViTConfig()
-    model = LQViT.from_pretrained(
-        'google/vit-base-patch16-224',
-        f'{dl_cfg.data_loc}/vit/vit-base-16-224.safetensors',
-        model_cfg,
-        key=key_model,
-        dtype=bfloat16,
-    )
+    model_init = partial(init_model, model_cfg, key=key_model, dtype=bfloat16)
 
     train_cfg = TrainConfig(
         batch_size=Batch.size,
@@ -72,7 +81,7 @@ if __name__ == '__main__':
             weight_decay=1e-2,
         ),
     )
-    tm = TrainModule(model, train_cfg, key=key_trainer)
+    tm = TrainModule(model_init, train_cfg, key=key_trainer)
     trainer = Trainer(max_epochs=100)
     initialise_tracking()
     jax.profiler.start_trace('.tmp/', create_perfetto_trace=True)

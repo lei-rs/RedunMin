@@ -1,12 +1,13 @@
+from typing import Iterable
+
 import jax
-from typing import Iterable, Any
 
 
 class Batcher:
-    def __init__(self, inner: Iterable, n_items: int, batch_size: int):
+    def __init__(self, inner: Iterable, batch_size: int, n_items: int = 2):
         self.inner = inner
-        self.n_items = n_items
         self.batch_size = batch_size
+        self.n_items = n_items
         self.buffer = [[0] * batch_size for _ in range(n_items)]
         self.buffer_idx = 0
 

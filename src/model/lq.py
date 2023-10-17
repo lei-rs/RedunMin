@@ -1,5 +1,4 @@
-import dataclasses
-from typing import Optional, Dict, Tuple, Any
+from typing import Optional, Dict, Tuple
 
 import equinox as eqx
 import haliax as hax
@@ -8,14 +7,13 @@ import jax
 import jax.numpy as jnp
 import jax.random as jax_rand
 import jax_dataclasses as jdc
-import jax.tree_util as jtu
 from google.cloud import storage
 from haliax import NamedArray, Axis
 from haliax.jax_utils import named_call
 from safetensors.numpy import load
 from transformers import ViTConfig as HFViTConfig
 
-from .levanter.safetensor import Serialize
+from .levanter.serialize import Serialize
 from .vit import ViTConfig, ViTEncoder
 
 
@@ -193,13 +191,13 @@ class GAPCls(eqx.Module):
 
 
 class LQViT(Serialize, eqx.Module):
-    config: LQViTConfig
-
     patch_embed: PatchEmbeddings
     pos_embed: NamedArray
     pool: RegPool
     vit_encoder: ViTEncoder
     cls_head: GAPCls
+
+    config: LQViTConfig = eqx.static_field()
 
     @staticmethod
     def init(config: LQViTConfig, *, key) -> 'LQViT':
