@@ -11,10 +11,10 @@ equinox
 haliax
 jaxtyping
 safetensors
-transformers
 google-cloud-storage
 pytest
 pytest-benchmark
 jax-smi
 jax_dataclasses
 lightning
+optax

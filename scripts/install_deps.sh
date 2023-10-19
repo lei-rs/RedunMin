@@ -18,4 +18,5 @@ conda activate main
 
 pip install jax[tpu] -f https://storage.googleapis.com/jax-releases/libtpu_releases.html
 pip install 'haliax @ git+https://github.com/stanford-crfm/haliax.git'
+pip install torch --index-url https://download.pytorch.org/whl/cpu
 pip install -r ../requirements.txt

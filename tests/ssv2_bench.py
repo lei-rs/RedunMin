@@ -37,7 +37,8 @@ def collate_put(cls, vid):
 
 @hax.named_jit(donate_args=(False, True, True))
 def cross_entropy(model: LQViT, targets: NamedArray, x: NamedArray, *, key, num_classes: 174) -> NamedArray:
-    raw_logits = model(x, key=key)
+    with hax.axis_mapping(compute_axis_mapping):
+        raw_logits = model(x, key=key)
     targets = targets.astype(jnp.int32)
     return softmax_cross_entropy(
         raw_logits.array,
@@ -65,8 +66,10 @@ config = DLConfig(
 loader = SSV2(config, key=key)
 loader.setup('train')
 initialise_tracking()
-os.makedirs('/tmp/tensorboard', exist_ok=True)
-with jax.profiler.trace('/tmp/tensorboard'):
+log_path = f'{os.environ["HOME"]}/tmp/tensorboard'
+os.makedirs(log_path, exist_ok=True)
+with jax.profiler.trace(log_path):
     for i, x in enumerate(tqdm(loader.train_dataloader())):
-        jax.block_until_ready(cross_entropy(model, x[0], x[1], key=key, num_classes=174))
-        #jax.block_until_ready(x)
+        with mesh:
+            jax.block_until_ready(cross_entropy(model, x[0], x[1], key=key, num_classes=174))
+            #jax.block_until_ready(x)

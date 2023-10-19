@@ -1,5 +1,4 @@
 from functools import partial
-from typing import Tuple
 
 import haliax as hax
 import jax
@@ -14,24 +13,31 @@ from jax_smi import initialise_tracking
 from lightning import Trainer
 
 import src.trainer as trainer
+import src.data.transforms as T
 from src.data.loader import DLConfig, SSV2
 from src.model.lq import LQViTConfig, LQViT
 from src.trainer import TrainConfig, TrainModule
 
-Batch = hax.Axis(name='batch', size=64)
+Batch = hax.Axis(name='batch', size=72)
 compute_axis_mapping = {'batch': 'data'}
 param_axis_mapping = {'embed': 'data'}
-global_mesh = Mesh(jax.devices('tpu'), 'data')
+mesh = Mesh(jax.devices('tpu'), 'data')
 
 
-def put(x: Tuple[NamedArray, NamedArray]) -> tuple[NamedArray, NamedArray]:
-    x1, x2 = x
-    '''with global_mesh:
-        return (
-            hax.shard_with_axis_mapping(x1, compute_axis_mapping),
-            hax.shard_with_axis_mapping(x2, compute_axis_mapping),
-        )'''
-    return jax.device_put(x1), jax.device_put(x2)
+TRAIN_AUG = T.Sequential([
+    T.TrivialAugment(),
+    T.Normalize().astype(jnp.bfloat16),
+])
+
+
+@hax.named_jit
+def collate_put(cls, vid):
+    cls = hax.named(jnp.stack(cls), 'batch')
+    vid = hax.named(jnp.stack(vid), ('batch', 'temporal', 'channels', 'height', 'width'))
+    with mesh:
+        cls = hax.shard_with_axis_mapping(cls, compute_axis_mapping)
+        vid = hax.shard_with_axis_mapping(vid, compute_axis_mapping)
+    return cls, vid
 
 
 def cross_entropy(model: LQViT, targets: NamedArray, x: NamedArray, *, key, num_classes: int) -> NamedArray:
@@ -43,14 +49,14 @@ def cross_entropy(model: LQViT, targets: NamedArray, x: NamedArray, *, key, num_
     ).mean()
 
 
-def init_model(*args, **kwargs):
-    model = LQViT.from_pretrained(
+def init_model(*args, dtype=bfloat16, **kwargs):
+    return LQViT.init(*args, **kwargs).astype(dtype)
+    '''return LQViT.from_pretrained(
         'google/vit-base-patch16-224',
         f'{dl_cfg.data_loc}/vit/vit-base-16-224.safetensors',
         *args,
         **kwargs,
-    )
-    return hax.shard_with_axis_mapping(model, param_axis_mapping)
+    )'''
 
 
 if __name__ == '__main__':
@@ -60,20 +66,26 @@ if __name__ == '__main__':
 
     dl_cfg = DLConfig(
         data_loc='gs://redunmin-us',
-        put_fn=put,
+        collate_put=collate_put,
+        transforms={
+            'train': TRAIN_AUG
+        },
         batch_size=Batch.size,
         shuffle=True,
         n_frames=32,
     )
     dl = SSV2(dl_cfg, key=key_dl)
 
-    model_cfg = LQViTConfig()
-    model_init = partial(init_model, model_cfg, key=key_model, dtype=bfloat16)
+    model_cfg = LQViTConfig(
+        t_dims=(32, 4),
+        n_classes=174
+    )
+    init_model = partial(init_model, model_cfg, key=key_model, dtype=bfloat16)
 
     train_cfg = TrainConfig(
         batch_size=Batch.size,
         loss_fn=partial(cross_entropy, num_classes=model_cfg.n_classes),
-        global_mesh=global_mesh,
+        mesh=mesh,
         compute_axis_mapping=compute_axis_mapping,
         param_axis_mapping=param_axis_mapping,
         optim=optax.adamw(
@@ -81,9 +93,8 @@ if __name__ == '__main__':
             weight_decay=1e-2,
         ),
     )
-    tm = TrainModule(model_init, train_cfg, key=key_trainer)
-    trainer = Trainer(max_epochs=100)
+
     initialise_tracking()
-    jax.profiler.start_trace('.tmp/', create_perfetto_trace=True)
+    tm = TrainModule(init_model, train_cfg, key=key_trainer)
+    trainer = Trainer(max_epochs=100)
     trainer.fit(tm, datamodule=dl)
-    jax.profiler.stop_trace()

@@ -5,6 +5,7 @@ from typing import Any, Iterable, Callable, Optional, Dict, Tuple
 import equinox as eqx
 import jax
 import pypeln as pl
+import torch
 from haliax import NamedArray
 from jax import Array
 from lightning import LightningDataModule
@@ -95,6 +96,9 @@ class DataLoader(LightningDataModule):
     def setup(self, stage: str) -> None:
         if len(self.readers) == 0:
             self.readers = {stage: self._build_reader(stage) for stage in ['train', 'val', 'test']}
+
+    def transfer_batch_to_device(self, batch: Any, device: torch.device, dataloader_idx: int) -> Any:
+        return batch
 
     def train_dataloader(self) -> Iterable:
         dl = self._get_loader('train')

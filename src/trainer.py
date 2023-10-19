@@ -1,5 +1,5 @@
 from dataclasses import dataclass
-from functools import cached_property, wraps
+from functools import cached_property
 from typing import Any, Dict, Callable
 
 import equinox as eqx
@@ -21,20 +21,19 @@ class TrainConfig:
     batch_size: int
     optim: GradientTransformation
     loss_fn: Callable
-    global_mesh: Mesh
+    mesh: Mesh
     compute_axis_mapping: Dict[str, str]
     param_axis_mapping: Dict[str, str]
     dist: bool = False
 
 
 class TrainModule(LightningModule):
-    def __init__(self, model_init: Callable[[], LQViT], cfg: TrainConfig, *, key):
+    def __init__(self, init_model: Callable[[], LQViT], cfg: TrainConfig, *, key):
         super().__init__()
-        self.model_init = model_init
+        self.model = init_model()
         self.cfg = cfg
         self.key = key
 
-        self.model = None
         self.opt_state = None
 
         self.automatic_optimization = False
@@ -46,8 +45,8 @@ class TrainModule(LightningModule):
 
     @staticmethod
     def filter_spec(model):
-        fs = jtu.tree_map(lambda _: False, model)
-        '''return eqx.tree_at(
+        fs = jtu.tree_map(lambda _: True, model)
+        '''fs = eqx.tree_at(
             lambda x: x.vit_encoder,
             fs,
             jtu.tree_map(lambda _: False, model.vit_encoder)
@@ -55,22 +54,15 @@ class TrainModule(LightningModule):
         return fs
 
     @cached_property
-    def loss_fn(self):
-        def _loss(model, *batch, **batch_kwargs):
-            with hax.axis_mapping(self.cfg.compute_axis_mapping):
-                return self.cfg.loss_fn(model, *batch, **batch_kwargs)
-        return named_jit(_loss, in_axis_resources=self.cfg.param_axis_mapping)
-
-    @cached_property
     def _forward_fn(self):
         @eqx.filter_value_and_grad
         def _forward(diff_model, static_model, *batch, **batch_kwargs):
             model = eqx.combine(diff_model, static_model)
-            return self.loss_fn(model, *batch, **batch_kwargs)
+            with hax.axis_mapping(self.cfg.compute_axis_mapping):
+                return self.cfg.loss_fn(model, *batch, **batch_kwargs)
         return named_jit(
             _forward,
-            out_axis_resources=self.cfg.param_axis_mapping,
-            donate_args=(True, True)
+            donate_args=(False, False, True, True),
         )
 
     @cached_property
@@ -79,7 +71,12 @@ class TrainModule(LightningModule):
             updates, opt_state = self.cfg.optim.update(grads, opt_state, params=params)
             model = eqx.apply_updates(model, updates)
             return model, opt_state
-        return _backward
+        return named_jit(
+            _backward,
+            self.cfg.param_axis_mapping,
+            in_axis_resources=self.cfg.param_axis_mapping,
+            donate_args=(True, True, True, True)
+        )
 
     @cached_property
     def _train_step_fn(self):
@@ -122,14 +119,13 @@ class TrainModule(LightningModule):
     def training_step(self, batch, batch_idx):
         self.key, key = jax.random.split(self.key)
 
-        with self.cfg.global_mesh:
-            '''loss, self.model, self.opt_state = self._train_step_fn(
+        with self.cfg.mesh:
+            loss, self.model, self.opt_state = self._train_step_fn(
                 self.model,
                 self.opt_state,
                 *batch,
                 key=key,
-            )'''
-            loss = self.loss_fn(self.model, *batch, key=key)
+            )
 
         loss = float(jax.block_until_ready(loss))
         self.log(
@@ -159,17 +155,18 @@ class TrainModule(LightningModule):
         return metrics['val_loss']'''
 
     def configure_optimizers(self):
+        @named_jit(
+            axis_resources=self.cfg.param_axis_mapping,
+            in_axis_resources=self.cfg.param_axis_mapping,
+            out_axis_resources=self.cfg.param_axis_mapping,
+            donate_args=True
+        )
         def _init_model_optim(model):
             fs = self.filter_spec(model)
             trainable, _ = eqx.partition(model, fs)
             trainable = eqx.filter(trainable, eqx.is_inexact_array)
             return model, self.cfg.optim.init(trainable)
-        with (self.cfg.global_mesh):
-            self.model, self.opt_state = named_jit(
-                _init_model_optim,
-                self.cfg.param_axis_mapping,
-                out_axis_resources=self.cfg.param_axis_mapping,
-                donate_args=True,
-            )(self.model_init())
+        with (self.cfg.mesh):
+            self.model, self.opt_state = _init_model_optim(self.model)
         if DEBUG:
             print(jax.debug.visualize_array_sharding(self.model.pos_embed.array[0]))
